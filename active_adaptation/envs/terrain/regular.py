@@ -31,9 +31,9 @@ PLANE_TERRAIN_CFG = TerrainImporterCfg(
     physics_material = sim_utils.RigidBodyMaterialCfg(
         friction_combine_mode="multiply",
         restitution_combine_mode="multiply",
-        static_friction=1.0,
-        dynamic_friction=1.0,
-        restitution=1.0,
+        static_friction=0.9,
+        dynamic_friction=0.9,
+        restitution=0.0,
         # improve_patch_friction=True
     ),
     visual_material=sim_utils.PreviewSurfaceCfg(
@@ -523,5 +523,4 @@ TERRAINS = {
     "random_uniform": ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=RANDOM_UNIFORM),
     "box_and_slope": ROUGH_TERRAIN_BASE_CFG.replace(terrain_generator=BOX_AND_SLOPE),
 }
-
 

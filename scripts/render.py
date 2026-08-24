@@ -20,10 +20,9 @@ import termcolor
 
 @hydra.main(config_path="../cfg", config_name="render", version_base=None)
 def main(cfg):
-    OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
-    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
+    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app, resolve=True))
     simulation_app = app_launcher.app
 
     # from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR
@@ -41,4 +40,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()
-

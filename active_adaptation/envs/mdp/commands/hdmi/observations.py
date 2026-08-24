@@ -428,14 +428,14 @@ class object_joint_pos(RobotObjectTrackObservation):
     Object joint position
     """
     def compute(self):
-        return self.command_manager.object_joint_pos.unsqueeze(1)
+        return self.command_manager.object_joint_pos.reshape(self.num_envs, -1)
 
 class object_joint_vel(RobotObjectTrackObservation):
     """
     Object joint velocity
     """
     def compute(self):
-        return self.command_manager.object_joint_vel.unsqueeze(1)
+        return self.command_manager.object_joint_vel.reshape(self.num_envs, -1)
 
 class object_joint_torque(RobotObjectTrackObservation):
     """
@@ -504,7 +504,7 @@ class diff_object_joint_pos_future(RobotObjectTrackObservation):
         ref_object_joint_pos_future = self.command_manager.ref_object_joint_pos_future
         object_joint_pos = self.command_manager.object_joint_pos
         diff_object_joint_pos_future = ref_object_joint_pos_future - object_joint_pos.unsqueeze(1)
-        return diff_object_joint_pos_future
+        return diff_object_joint_pos_future.reshape(self.num_envs, -1)
 
 class ref_object_contact_future(RobotObjectTrackObservation):
     def compute(self):

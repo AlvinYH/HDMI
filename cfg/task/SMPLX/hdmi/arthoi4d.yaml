@@ -1,0 +1,118 @@
+# @package task
+defaults:
+  - base/hdmi-base
+  - _self_
+
+name: ArtHOI4DSMPLX
+terrain: arthoi4d_plane
+num_envs: 4096
+max_episode_length: 1000
+
+static_support_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_SUPPORT_NAMES}}
+
+robot:
+  name: arthoi4d_smplx
+  robot_type: arthoi4d_smplx
+  contact_body_name: Pelvis
+
+action:
+  action_scaling_replace: 0.25
+  # Do not delay policy outputs beyond the common 30 Hz action boundary.
+  min_delay: 0
+  max_delay: 0
+  alpha: [0.8, 1.0]
+
+command:
+  data_path: ${oc.env:ARTHOI4D_HDMI_MOTION_DIR}
+  tracking_keypoint_names: [".*"]
+  tracking_joint_names: [".*"]
+  root_body_name: Pelvis
+  reset_range: [0, 1]
+  object_asset_name: arthoi4d_object
+  object_body_name: ${oc.env:ARTHOI4D_HDMI_OBJECT_BODY}
+  contact_target_body_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_BODY_NAMES}}
+  contact_target_pos_offset: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_POS_OFFSETS}}
+  contact_region_link_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_REGION_LINK_NAMES}}
+  object_joint_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_JOINT_NAMES}}
+  object_reset_joint_pos: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_INITIAL_QPOS}}
+  pose_range:
+    x: [0.0, 0.0]
+    y: [0.0, 0.0]
+    z: [0.0, 0.0]
+    roll: [0.0, 0.0]
+    pitch: [0.0, 0.0]
+    yaw: [0.0, 0.0]
+  velocity_range:
+    x: [0.0, 0.0]
+    y: [0.0, 0.0]
+    z: [0.0, 0.0]
+    roll: [0.0, 0.0]
+    pitch: [0.0, 0.0]
+    yaw: [0.0, 0.0]
+  init_joint_pos_noise: 0.0
+  init_joint_vel_noise: 0.0
+  object_pose_range:
+    x: [0.0, 0.0]
+    y: [0.0, 0.0]
+    z: [0.0, 0.0]
+    roll: [0.0, 0.0]
+    pitch: [0.0, 0.0]
+    yaw: [0.0, 0.0]
+  object_init_joint_pos_noise: 0.0
+  object_init_joint_vel_noise: 0.0
+  contact_eef_body_name: [L_Wrist, R_Wrist]
+  contact_frc_eef_body_name: [L_Wrist, R_Wrist]
+  contact_eef_pos_offset: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
+
+observation:
+  priv:
+    body_pos_b: {body_names: [L_Ankle, R_Ankle]}
+    body_vel_b: {body_names: [L_Ankle, R_Ankle]}
+    body_height: {body_names: [L_Ankle, R_Ankle, Pelvis, Torso]}
+    object_joint_pos: {}
+    object_joint_vel: {}
+
+reward:
+  tracking:
+    tracking_upper_body_pos(keypoint_pos_tracking_local_product):
+      {body_names: [L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist]}
+    tracking_upper_body_ori(keypoint_ori_tracking_local_product):
+      {body_names: [L_Shoulder, R_Shoulder, L_Elbow, R_Elbow, L_Wrist, R_Wrist]}
+    tracking_lower_body_pos(keypoint_pos_tracking_local_product):
+      {body_names: [L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle]}
+    tracking_lower_body_ori(keypoint_ori_tracking_local_product):
+      {body_names: [L_Hip, R_Hip, L_Knee, R_Knee, L_Ankle, R_Ankle]}
+    tracking_root_pos(keypoint_pos_tracking_product): {body_names: [Pelvis]}
+    tracking_root_ori(keypoint_ori_tracking_product): {body_names: [Pelvis]}
+    tracking_body_linvel(keypoint_lin_vel_tracking_product): {body_names: [".*"]}
+    tracking_body_angvel(keypoint_ang_vel_tracking_product): {body_names: [".*"]}
+    joint_pos_tracking_product: {joint_names: [".*"]}
+    joint_vel_tracking_product: {joint_names: [".*"]}
+  object_tracking:
+    object_joint_pos_tracking: {weight: 1.0, sigma: 0.5}
+  feet:
+    impact_force_l2: null
+    feet_slip: null
+    feet_air_time: null
+  debug:
+    feet_air_time: null
+    feet_contact_count: null
+    root_pos_error(keypoint_pos_error): {body_names: [Pelvis]}
+    root_ori_error(keypoint_ori_error): {body_names: [Pelvis]}
+    body_pos_error_local(keypoint_pos_error_local): {body_names: [".*"]}
+    body_ori_error_local(keypoint_ori_error_local): {body_names: [".*"]}
+    joint_pos_error: {joint_names: [".*"]}
+
+randomization:
+  # Disable every inherited DR that can alter a matched-physics contract field.
+  # `null` is handled by BaseEnv as an explicit disabled randomization.
+  perturb_body_mass: null
+  perturb_body_materials: null
+  perturb_body_com: null
+  random_joint_offset: null
+
+termination:
+  cum_body_pos_error: {body_names: Torso}
+  cum_body_ori_error: {body_names: Torso}
+  cum_body_pos_error_local: {body_names: ".*"}
+  cum_body_ori_error_local: {body_names: ".*"}

@@ -359,7 +359,7 @@ class object_joint_pos_tracking(RobotObjectTrackReward):
         ref_joint_pos = self.command_manager.ref_object_joint_pos
         object_joint_pos = self.command_manager.object_joint_pos
         joint_pos_diff = ref_joint_pos - object_joint_pos
-        joint_pos_error = joint_pos_diff.abs()
+        joint_pos_error = joint_pos_diff.abs().mean(dim=-1)
         # shape: [num_envs]
         rew = torch.exp(- joint_pos_error / self.sigma).unsqueeze(1)
         return rew

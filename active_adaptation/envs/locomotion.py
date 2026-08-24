@@ -45,7 +45,13 @@ class SimpleEnv(_Env):
             from isaaclab.assets import AssetBaseCfg, ArticulationCfg
             from isaaclab.sensors import ContactSensorCfg
             from isaaclab.utils.assets import ISAAC_NUCLEUS_DIR, ISAACLAB_NUCLEUS_DIR
-            from active_adaptation.assets import ROBOTS, OBJECTS, get_asset_meta
+            from active_adaptation.assets import (
+                OBJECTS,
+                OBJECT_BODY_PRIM_PATHS,
+                ROBOTS,
+                ROBOT_BODY_PRIM_PATHS,
+                get_asset_meta,
+            )
             from active_adaptation.envs.terrain import TERRAINS
             
             env_spacing = self.cfg.viewer.get("env_spacing", 2.0)
@@ -67,6 +73,11 @@ class SimpleEnv(_Env):
             robot_type = self.cfg.robot.get("robot_type", self.cfg.robot.name)
             scene_cfg.robot.spawn.usd_path = scene_cfg.robot.spawn.usd_path.format(ROBOT_TYPE=robot_type)
 
+            for support_name in self.cfg.get("static_support_names", []):
+                support_cfg = OBJECTS[support_name]
+                support_cfg.prim_path = "{ENV_REGEX_NS}/" + support_name
+                setattr(scene_cfg, support_name, support_cfg)
+
             # if self.cfg.command._target_ == "active_adaptation.envs.mdp.commands.hdmi.command.RobotObjectTracking":
             if "object_asset_name" in self.cfg.command:
                 extra_object_names = self.cfg.command.get("extra_object_names", [])
@@ -85,19 +96,66 @@ class SimpleEnv(_Env):
                 print(f"Using object type {obj_type} with asset {obj_cfg.spawn.usd_path}")
                 setattr(scene_cfg, obj_name, obj_cfg)
 
-                # add contact sensor to the box
+                # Contact reward targets are method-native.  The separate region
+                # sensors below are the shared benchmark telemetry and always
+                # cover the Studio-selected collision links.
                 eef_names = self.cfg.command.get("contact_eef_body_name", [])
-                contact_geom_prim_path = "{ENV_REGEX_NS}/" + obj_name + "/" + obj_contact_body_name
+                target_body_names = self.cfg.command.get(
+                    "contact_target_body_names",
+                    [obj_contact_body_name] * len(eef_names),
+                )
+                if len(target_body_names) != len(eef_names):
+                    raise ValueError("contact target body names must match contact eef names")
+                contact_region_link_names = list(
+                    self.cfg.command.get("contact_region_link_names", [])
+                )
+                if not contact_region_link_names:
+                    raise ValueError("ArtHOI4D requires at least one contact-region link")
+                if len(set(contact_region_link_names)) != len(contact_region_link_names):
+                    raise ValueError("ArtHOI4D contact-region links must be unique")
+                robot_body_paths = ROBOT_BODY_PRIM_PATHS.get(self.cfg.robot.name, {})
+                object_body_paths = OBJECT_BODY_PRIM_PATHS.get(obj_name, {})
 
-                for eef_name in eef_names:
+                for eef_name, target_body_name in zip(eef_names, target_body_names):
                     contact_sensor_name = f"{eef_name}_{obj_name}_contact_forces"
-                    eef_prim_path = "{ENV_REGEX_NS}/Robot/" + eef_name
+                    eef_prim_path = (
+                        "{ENV_REGEX_NS}/Robot/"
+                        + robot_body_paths.get(eef_name, eef_name)
+                    )
+                    contact_geom_prim_path = (
+                        "{ENV_REGEX_NS}/" + obj_name + "/"
+                        + object_body_paths.get(target_body_name, target_body_name)
+                    )
                     setattr(scene_cfg, contact_sensor_name, ContactSensorCfg(
                         prim_path=eef_prim_path,
                         history_length=0,
                         track_air_time=False,
                         filter_prim_paths_expr=[contact_geom_prim_path],
                     ))
+
+                    # Use one filtered sensor for every selected link.  Isaac Lab
+                    # then reports forces from this hand to exactly that link,
+                    # rather than inferring benchmark contact from the native
+                    # reward target point.
+                    for region_link_name in contact_region_link_names:
+                        if region_link_name not in object_body_paths:
+                            raise ValueError(
+                                "ArtHOI4D contact-region link is missing from the "
+                                f"loaded object: {region_link_name}"
+                            )
+                        region_sensor_name = (
+                            f"{eef_name}_{obj_name}_{region_link_name}_region_contact_forces"
+                        )
+                        region_geom_prim_path = (
+                            "{ENV_REGEX_NS}/" + obj_name + "/"
+                            + object_body_paths[region_link_name]
+                        )
+                        setattr(scene_cfg, region_sensor_name, ContactSensorCfg(
+                            prim_path=eef_prim_path,
+                            history_length=0,
+                            track_air_time=False,
+                            filter_prim_paths_expr=[region_geom_prim_path],
+                        ))
                     
             body_scale_rand = self.cfg.randomization.get("body_scale", None)
             if body_scale_rand is not None:
@@ -109,9 +167,23 @@ class SimpleEnv(_Env):
                 asset.spawn.homogeneous_scale = body_scale_rand.get("homogeneous_scale", False)
                 print(f"Randomized {body_scale_rand.name} scale to {asset.spawn.scale_range}")
 
-            scene_cfg.terrain = TERRAINS[self.cfg.terrain]
+            if self.cfg.terrain == "arthoi4d_plane":
+                from active_adaptation.assets.arthoi4d import ARTHOI4D_TERRAIN
+
+                scene_cfg.terrain = ARTHOI4D_TERRAIN
+            else:
+                scene_cfg.terrain = TERRAINS[self.cfg.terrain]
+            contact_body_name = self.cfg.robot.get("contact_body_name", None)
+            if contact_body_name is None:
+                contact_body_path = self.cfg.robot.get(
+                    "contact_body_expr", ".*(ankle_roll|wrist_.*)_link"
+                )
+            else:
+                contact_body_path = ROBOT_BODY_PRIM_PATHS.get(
+                    self.cfg.robot.name, {}
+                ).get(contact_body_name, contact_body_name)
             scene_cfg.contact_forces = ContactSensorCfg(
-                prim_path="{ENV_REGEX_NS}/Robot/.*(ankle_roll|wrist_.*)_link", 
+                prim_path="{ENV_REGEX_NS}/Robot/" + contact_body_path,
                 history_length=3,
                 track_air_time=True
             )
@@ -173,6 +245,7 @@ class SimpleEnv(_Env):
             
             sim_cfg = sim_utils.SimulationCfg(
                 dt=self.cfg.sim.isaac_physics_dt,
+                gravity=tuple(self.cfg.sim.gravity),
                 render=sim_utils.RenderCfg(
                     rendering_mode="quality",
                     # antialiasing_mode="FXAA",
@@ -181,6 +254,7 @@ class SimpleEnv(_Env):
                 ),
                 device=f"cuda:{active_adaptation.get_local_rank()}"
             )
+            sim_cfg.physx.solver_type = int(self.cfg.sim.solver_type)
             
             # slightly reduces GPU memory usage
             # sim_cfg.physx.gpu_max_rigid_contact_count = 2**21
@@ -192,7 +266,18 @@ class SimpleEnv(_Env):
             # sim_cfg.physx.gpu_collision_stack_size = 2**25
             # sim_cfg.physx.gpu_heap_capacity = 2**24
             
-            self.sim, self.scene = scene.create_isaaclab_sim_and_scene(sim_cfg, scene_cfg)
+            before_first_step = None
+            if self.cfg.get("static_support_names", []):
+                from active_adaptation.assets.arthoi4d import (
+                    apply_arthoi4d_table_collision_filter,
+                )
+
+                before_first_step = apply_arthoi4d_table_collision_filter
+            self.sim, self.scene = scene.create_isaaclab_sim_and_scene(
+                sim_cfg,
+                scene_cfg,
+                before_first_step=before_first_step,
+            )
 
             # set camera view for "/OmniverseKit_Persp" camera
             self.sim.set_camera_view(eye=self.cfg.viewer.eye, target=self.cfg.viewer.lookat)
@@ -256,4 +341,3 @@ class SimpleEnv(_Env):
         #     target=self.robot.data.root_pos_w[look_at_env_id].cpu() + torch.as_tensor(self.cfg.viewer.lookat)
         # )
         return super().render(mode)
-

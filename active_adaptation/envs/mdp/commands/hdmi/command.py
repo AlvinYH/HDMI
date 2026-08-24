@@ -345,6 +345,8 @@ class RobotObjectTracking(RobotTracking):
         object_asset_name: str, # for finding the object in the scene
         object_body_name: str, # for the body that defines the contact target position
         object_joint_name: str | None = None, # object joint to track
+        object_joint_names: List[str] | None = None,
+        object_reset_joint_pos: List[float] | None = None,
         # for reset
         object_pose_range: Dict[str, Tuple[float, float]] = {
             "x": (-0.0, 0.0),
@@ -358,6 +360,8 @@ class RobotObjectTracking(RobotTracking):
         # for contact rewards
         contact_eef_body_name: List[str] = ["left_wrist_yaw_link", "right_wrist_yaw_link"],
         contact_frc_eef_body_name: List[str | List[str]] = ["left_wrist_(roll|pitch|yaw)_link", "right_wrist_(roll|pitch|yaw)_link"],
+        contact_target_body_names: List[str] | None = None,
+        contact_region_link_names: List[str] | None = None,
         ## offset from object to contact target position
         contact_target_pos_offset: List[Tuple[float, float, float]] = [(0.0, 0.0, 0.0), (0.0, 0.0, 0.0)],
         ## offset from end effector
@@ -370,14 +374,28 @@ class RobotObjectTracking(RobotTracking):
         self.extra_object_body_id_motion = [self.dataset.body_names.index(name) for name in extra_object_names]
 
         self.object_asset_name = object_asset_name
-        if object_joint_name is None:
+        if object_joint_names is None:
+            object_joint_names = [] if object_joint_name is None else [object_joint_name]
+        elif object_joint_name is not None:
+            raise ValueError("Use object_joint_name or object_joint_names, not both")
+        self.object_joint_names = list(object_joint_names)
+        if not self.object_joint_names:
             self.object = self.env.scene.rigid_objects[object_asset_name]
-            self.object_joint_idx_motion = None
-            self.object_joint_idx_asset = None
+            self.object_joint_indices_motion = None
+            self.object_joint_indices_asset = None
         else:
             self.object = self.env.scene.articulations[object_asset_name]
-            self.object_joint_idx_motion = self.dataset.joint_names.index(object_joint_name)
-            self.object_joint_idx_asset = self.object.joint_names.index(object_joint_name)
+            self.object_joint_indices_motion = [
+                self.dataset.joint_names.index(name) for name in self.object_joint_names
+            ]
+            self.object_joint_indices_asset = [
+                self.object.joint_names.index(name) for name in self.object_joint_names
+            ]
+        if object_reset_joint_pos is not None and len(object_reset_joint_pos) != len(self.object_joint_names):
+            raise ValueError("object_reset_joint_pos must match object_joint_names")
+        self.object_reset_joint_pos = None if object_reset_joint_pos is None else torch.tensor(
+            object_reset_joint_pos, dtype=torch.float32, device=self.device
+        )
         
         self.object_body_id_asset = self.object.body_names.index(object_body_name)
         self.object_body_id_motion = self.dataset.body_names.index(object_asset_name)
@@ -393,10 +411,31 @@ class RobotObjectTracking(RobotTracking):
             self.object_init_joint_vel_noise = 0.0
 
         # setup contact body indices
-        assert len(contact_eef_body_name) == len(contact_target_pos_offset) == len(contact_eef_pos_offset), \
-            "contact_eef_body_name, contact_target_pos_offset, and contact_eef_pos_offset must have the same length"
         self.num_eefs = len(contact_eef_body_name)
+        if contact_target_body_names is None:
+            contact_target_body_names = [object_body_name] * self.num_eefs
+        assert self.num_eefs == len(contact_target_body_names) == len(contact_target_pos_offset) == len(contact_eef_pos_offset), \
+            "contact eef names, target body names, target offsets, and eef offsets must have the same length"
         self.contact_eef_body_indices_asset = [self.asset.body_names.index(name) for name in contact_eef_body_name]
+        self.contact_target_body_indices_asset = [
+            self.object.body_names.index(name) for name in contact_target_body_names
+        ]
+        if not contact_region_link_names:
+            raise ValueError("RobotObjectTracking requires at least one contact-region link")
+        self.contact_region_link_names = list(contact_region_link_names)
+        if len(set(self.contact_region_link_names)) != len(self.contact_region_link_names):
+            raise ValueError("contact_region_link_names must be unique")
+        missing_region_links = sorted(
+            set(self.contact_region_link_names).difference(self.object.body_names)
+        )
+        if missing_region_links:
+            raise ValueError(
+                "contact_region_link_names are absent from the loaded object: "
+                f"{missing_region_links}"
+            )
+        self.contact_region_body_indices_asset = [
+            self.object.body_names.index(name) for name in self.contact_region_link_names
+        ]
 
         self.eef_filtered_sensor: List[List[ContactSensor]] = []
         # [self.env.scene.sensors[f"{eef_name}_{object_asset_name}_contact_forces"] for eef_name in contact_eef_body_name] for object_asset_name in self.asset.data.object_names]
@@ -414,6 +453,31 @@ class RobotObjectTracking(RobotTracking):
             self.eef_filtered_sensor.append(sensors_for_this_eef)
             self.eef_filtered_sensor_indices.append(sensor_indices_for_this_eef)
 
+        # Keep the native reward sensors above unchanged.  These sensors are
+        # exclusively the shared contact-region telemetry used by the Studio
+        # rollout exporter.
+        self.eef_region_sensors: List[List[List[ContactSensor]]] = []
+        self.eef_region_sensor_indices: List[List[List[int]]] = []
+        for eef_name in contact_eef_body_name:
+            matched_eef_names = self.asset.find_bodies(eef_name)[1]
+            sensors_for_eef: List[List[ContactSensor]] = []
+            indices_for_eef: List[List[int]] = []
+            for region_link_name in self.contact_region_link_names:
+                sensors_for_region: List[ContactSensor] = []
+                indices_for_region: List[int] = []
+                for matched_eef_name in matched_eef_names:
+                    sensor_name = (
+                        f"{matched_eef_name}_{object_asset_name}_{region_link_name}_"
+                        "region_contact_forces"
+                    )
+                    sensor = self.env.scene.sensors[sensor_name]
+                    sensors_for_region.append(sensor)
+                    indices_for_region.append(sensor.body_names.index(matched_eef_name))
+                sensors_for_eef.append(sensors_for_region)
+                indices_for_eef.append(indices_for_region)
+            self.eef_region_sensors.append(sensors_for_eef)
+            self.eef_region_sensor_indices.append(indices_for_eef)
+
         with torch.device(self.device):
             self.contact_target_pos_offset = torch.tensor(contact_target_pos_offset, device=self.device).repeat(self.num_envs, 1, 1)
             self.contact_eef_pos_offset = torch.tensor(contact_eef_pos_offset, device=self.device).repeat(self.num_envs, 1, 1)
@@ -423,6 +487,25 @@ class RobotObjectTracking(RobotTracking):
 
             self.eef_contact_forces_w = torch.zeros(self.num_envs, len(contact_eef_body_name), 3, device=self.device)
             self.eef_contact_forces_b = torch.zeros(self.num_envs, len(contact_eef_body_name), 3, device=self.device)
+            region_count = len(self.contact_region_link_names)
+            self.eef_region_forces_w = torch.zeros(
+                self.num_envs, len(contact_eef_body_name), region_count, 3, device=self.device
+            )
+            self.eef_region_force_n = torch.zeros(
+                self.num_envs, len(contact_eef_body_name), region_count, device=self.device
+            )
+            self.hand_force_n = torch.zeros(
+                self.num_envs, len(contact_eef_body_name), device=self.device
+            )
+            self.region_force_n = torch.zeros(
+                self.num_envs, region_count, device=self.device
+            )
+            self.contact_region_pos_w = torch.zeros(
+                self.num_envs, region_count, 3, device=self.device
+            )
+            self.eef_region_link_center_distance_m = torch.zeros(
+                self.num_envs, len(contact_eef_body_name), region_count, device=self.device
+            )
         
         scale = getattr(self.object.cfg.spawn, "scale", None)
         if not isinstance(scale, torch.Tensor):
@@ -496,9 +579,12 @@ class RobotObjectTracking(RobotTracking):
         # object_quat_b = quat_mul(quat_conjugate(robot_quat_w), init_object_quat)
         # print(f"Object initial position in robot frame: {object_pos_b}, orientation: {object_quat_b}")
 
-        if self.object_joint_idx_asset is not None:
-            init_joint_pos = self._motion_reset.joint_pos[:, self.object_joint_idx_motion].unsqueeze(1)
-            init_joint_vel = self._motion_reset.joint_vel[:, self.object_joint_idx_motion].unsqueeze(1)
+        if self.object_joint_indices_asset is not None:
+            init_joint_pos = self._motion_reset.joint_pos[:, self.object_joint_indices_motion].clone()
+            init_joint_vel = self._motion_reset.joint_vel[:, self.object_joint_indices_motion].clone()
+            if self.object_reset_joint_pos is not None:
+                init_joint_pos[:] = self.object_reset_joint_pos
+                init_joint_vel.zero_()
 
             joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
             joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise
@@ -506,12 +592,15 @@ class RobotObjectTracking(RobotTracking):
             init_joint_pos += joint_pos_noise
             init_joint_vel += joint_vel_noise
             
-            joint_pos_limits = self.object.data.soft_joint_pos_limits[env_ids]
-            joint_vel_limits = self.object.data.soft_joint_vel_limits[env_ids]
+            joint_pos_limits = self.object.data.soft_joint_pos_limits[env_ids][:, self.object_joint_indices_asset]
+            joint_vel_limits = self.object.data.soft_joint_vel_limits[env_ids][:, self.object_joint_indices_asset]
             init_joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
             init_joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
 
-            self.object.write_joint_state_to_sim(init_joint_pos, init_joint_vel, env_ids=env_ids, joint_ids=[self.object_joint_idx_asset])
+            self.object.write_joint_state_to_sim(
+                init_joint_pos, init_joint_vel, env_ids=env_ids,
+                joint_ids=self.object_joint_indices_asset,
+            )
 
     def _save_motion(self):
         motion_data: TensorDict = torch.cat(self.motion_frames, dim=0)
@@ -554,13 +643,13 @@ class RobotObjectTracking(RobotTracking):
         self.object_pos_w = self.object.data.root_link_pos_w
         self.object_quat_w = self.object.data.root_link_quat_w
 
-        if self.object_joint_idx_asset is not None:
-            self.ref_object_joint_pos_future = self.future_ref_motion.joint_pos[..., self.object_joint_idx_motion]
-            self.ref_object_joint_vel_future = self.future_ref_motion.joint_vel[..., self.object_joint_idx_motion]
+        if self.object_joint_indices_asset is not None:
+            self.ref_object_joint_pos_future = self.future_ref_motion.joint_pos[..., self.object_joint_indices_motion]
+            self.ref_object_joint_vel_future = self.future_ref_motion.joint_vel[..., self.object_joint_indices_motion]
             self.ref_object_joint_pos = self.ref_object_joint_pos_future[:, 0]
             self.ref_object_joint_vel = self.ref_object_joint_vel_future[:, 0]
-            self.object_joint_pos = self.object.data.joint_pos[:, self.object_joint_idx_asset]
-            self.object_joint_vel = self.object.data.joint_vel[:, self.object_joint_idx_asset]
+            self.object_joint_pos = self.object.data.joint_pos[:, self.object_joint_indices_asset]
+            self.object_joint_vel = self.object.data.joint_vel[:, self.object_joint_indices_asset]
             
         idx = (self.motion_starts + self.t).unsqueeze(1) + self.future_steps.unsqueeze(0)
         idx.clamp_max_(self.motion_ends.unsqueeze(1) - 1)
@@ -568,9 +657,9 @@ class RobotObjectTracking(RobotTracking):
         self.ref_object_contact = self.ref_object_contact_future[:, 0]
         
         # contact target and eef pos
-        object_pos_w = self.object.data.body_link_pos_w[:, self.object_body_id_asset]
-        object_quat_w = self.object.data.body_link_quat_w[:, self.object_body_id_asset]
-        self.contact_target_pos_w[:] = object_pos_w.unsqueeze(1) + quat_apply(object_quat_w.unsqueeze(1), self.contact_target_pos_offset)
+        object_pos_w = self.object.data.body_link_pos_w[:, self.contact_target_body_indices_asset]
+        object_quat_w = self.object.data.body_link_quat_w[:, self.contact_target_body_indices_asset]
+        self.contact_target_pos_w[:] = object_pos_w + quat_apply(object_quat_w, self.contact_target_pos_offset)
         
         eef_pos_w = self.asset.data.body_link_pos_w[:, self.contact_eef_body_indices_asset]
         eef_quat_w = self.asset.data.body_link_quat_w[:, self.contact_eef_body_indices_asset]
@@ -581,7 +670,33 @@ class RobotObjectTracking(RobotTracking):
             for eef_sensor, eef_sensor_id in zip(eef_sensors, eef_sensor_indices):
                 self.eef_contact_forces_w[:, eef_idx] += eef_sensor.data.force_matrix_w[:, eef_sensor_id, 0]
 
-        self.eef_contact_forces_b[:] = quat_apply_inverse(object_quat_w.unsqueeze(1), self.eef_contact_forces_w)
+        self.eef_contact_forces_b[:] = quat_apply_inverse(object_quat_w, self.eef_contact_forces_w)
+
+        self.eef_region_forces_w.zero_()
+        for eef_index, (regions, region_indices) in enumerate(
+            zip(self.eef_region_sensors, self.eef_region_sensor_indices)
+        ):
+            for region_index, (sensors, sensor_indices) in enumerate(
+                zip(regions, region_indices)
+            ):
+                for sensor, sensor_index in zip(sensors, sensor_indices):
+                    # The filtered dimension may contain multiple collider prims
+                    # below one URDF link, so sum it instead of assuming index 0.
+                    self.eef_region_forces_w[:, eef_index, region_index] += (
+                        sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
+                    )
+        self.eef_region_force_n[:] = torch.linalg.vector_norm(
+            self.eef_region_forces_w, dim=-1
+        )
+        self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
+        self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
+        self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
+            :, self.contact_region_body_indices_asset
+        ]
+        self.eef_region_link_center_distance_m[:] = torch.linalg.vector_norm(
+            self.contact_eef_pos_w[:, :, None] - self.contact_region_pos_w[:, None],
+            dim=-1,
+        )
 
     def _init_debug_draw(self):
         super()._init_debug_draw()

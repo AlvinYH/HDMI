@@ -9,6 +9,20 @@ ASSET_PATH = os.path.dirname(__file__)
 ROBOTS = {
     "g1": G1_CYLINDER_CFG,
 }
+ROBOT_BODY_PRIM_PATHS = {}
+OBJECT_BODY_PRIM_PATHS = {}
+
+if os.environ.get("ARTHOI4D_HDMI_INPUT_PATH"):
+    from .arthoi4d import (
+        ARTHOI4D_OBJECT_BODY_PRIM_PATHS,
+        ARTHOI4D_OBJECT_CFG,
+        ARTHOI4D_ROBOT_BODY_PRIM_PATHS,
+        ARTHOI4D_SMPLX_CFG,
+        ARTHOI4D_SUPPORT_CFGS,
+    )
+    ROBOTS["arthoi4d_smplx"] = ARTHOI4D_SMPLX_CFG
+    ROBOT_BODY_PRIM_PATHS["arthoi4d_smplx"] = ARTHOI4D_ROBOT_BODY_PRIM_PATHS
+    OBJECT_BODY_PRIM_PATHS["arthoi4d_object"] = ARTHOI4D_OBJECT_BODY_PRIM_PATHS
 
 OBJECTS = {
     "door": DOOR_CFG,
@@ -32,6 +46,10 @@ OBJECTS = {
     "platform1": PLATFORM1_CFG,
 }
 
+if os.environ.get("ARTHOI4D_HDMI_INPUT_PATH"):
+    OBJECTS["arthoi4d_object"] = ARTHOI4D_OBJECT_CFG
+    OBJECTS.update(ARTHOI4D_SUPPORT_CFGS)
+
 
 def get_asset_meta(asset: Articulation):
     if not asset.is_initialized:
@@ -50,4 +68,3 @@ def get_asset_meta(asset: Articulation):
     for actuator_name, actuator in asset.actuators.items():
         meta["actuators"][actuator_name] = actuator.cfg.to_dict()
     return meta
-

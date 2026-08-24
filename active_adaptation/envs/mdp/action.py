@@ -39,12 +39,15 @@ class JointPosition(ActionManager):
         self,
         env,
         action_scaling: float | Dict[str, float] = 0.5,
+        action_scaling_replace: float | None = None,
         min_delay: int = 0,
         max_delay: int = 0,
         alpha: float | Tuple[float, float] = 0.5,
         **kwargs,
     ):
         super().__init__(env)
+        if action_scaling_replace is not None:
+            action_scaling = {".*": float(action_scaling_replace)}
         self.joint_ids, self.joint_names, self.action_scaling = (
             string_utils.resolve_matching_names_values(
                 dict(action_scaling), self.asset.joint_names

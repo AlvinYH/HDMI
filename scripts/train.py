@@ -34,12 +34,11 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
-    OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
     app_launcher = AppLauncher(
-        OmegaConf.to_container(cfg.app),
+        OmegaConf.to_container(cfg.app, resolve=True),
         distributed=aa.is_distributed(),
         device=f"cuda:{aa.get_local_rank()}"
     )
@@ -58,6 +57,7 @@ def main(cfg: DictConfig):
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 
+    os.makedirs(run.dir, exist_ok=True)
     cfg_save_path = os.path.join(run.dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")
@@ -211,4 +211,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

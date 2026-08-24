@@ -20,10 +20,9 @@ import termcolor
 
 @hydra.main(config_path="../cfg", config_name="eval", version_base=None)
 def main(cfg: DictConfig):
-    OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
-    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
+    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app, resolve=True))
     simulation_app = app_launcher.app
 
     env, agent, vecnorm = make_env_policy(cfg)
@@ -79,4 +78,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

@@ -1,4 +1,5 @@
 import active_adaptation
+from collections.abc import Callable
 
 
 if active_adaptation.get_backend() == "isaac":
@@ -8,7 +9,8 @@ if active_adaptation.get_backend() == "isaac":
 
     def create_isaaclab_sim_and_scene(
         sim_cfg: SimulationCfg,
-        scene_cfg: InteractiveSceneCfg
+        scene_cfg: InteractiveSceneCfg,
+        before_first_step: Callable[[InteractiveScene], None] | None = None,
     ):
         # create a simulation context to control the simulator
         if SimulationContext.instance() is None:
@@ -16,6 +18,8 @@ if active_adaptation.get_backend() == "isaac":
         else:
             raise RuntimeError("Simulation context already exists. Cannot create a new one.")
         scene = InteractiveScene(scene_cfg)
+        if before_first_step is not None:
+            before_first_step(scene)
         if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
             sim.reset()
         sim.step(render=sim.has_gui())
@@ -25,5 +29,4 @@ elif active_adaptation.get_backend() == "mujoco":
     pass
 else:
     raise NotImplementedError
-
 

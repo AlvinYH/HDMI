@@ -20,7 +20,6 @@ import termcolor
 
 @hydra.main(config_path="../cfg", config_name="eval", version_base=None)
 def main(cfg: DictConfig):
-    OmegaConf.resolve(cfg)
     OmegaConf.set_struct(cfg, False)
     
     # --- 1. Parse Checkpoint Path ---
@@ -31,7 +30,7 @@ def main(cfg: DictConfig):
     
     # --- 2. Initialize Env and Policy Shell ---
     # This is done only once to save time
-    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app))
+    app_launcher = AppLauncher(OmegaConf.to_container(cfg.app, resolve=True))
     simulation_app = app_launcher.app
 
     env, agent, vecnorm = make_env_policy(cfg)

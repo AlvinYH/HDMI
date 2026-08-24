@@ -14,8 +14,10 @@ num_envs: 4096
 max_episode_length: 1000
 
 sim:
-  step_dt: 0.02
-  isaac_physics_dt: 0.005
+  # 30 Hz policy actions, each held for two 60 Hz Isaac physics steps.
+  step_dt: 0.03333333333333333
+  isaac_physics_dt: 0.016666666666666666
+  solver_type: 1
   mujoco_physics_dt: 0.002
 
 robot:
