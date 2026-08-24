@@ -65,6 +65,17 @@ command:
   contact_eef_pos_offset: [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]]
 
 observation:
+  # Keep HDMI's native observation schema while removing stochastic input noise
+  # from the matched-physics ARCTIC benchmark.
+  policy:
+    root_ang_vel_history: {history_steps: [0], noise_std: 0.0}
+    projected_gravity_history: {history_steps: [0], noise_std: 0.0}
+    joint_pos_history: {history_steps: [0, 1, 2, 3, 4, 8], noise_std: 0.0}
+    prev_actions: {steps: 3}
+  object:
+    object_xy_b: {noise_std: 0.0, episodic_noise_std: 0.0}
+    object_heading_b: {noise_std: 0.0, episodic_noise_std: 0.0}
+    ref_contact_pos_b: {noise_std: 0.0, episodic_noise_std: 0.0, yaw_only: true}
   priv:
     body_pos_b: {body_names: [L_Ankle, R_Ankle]}
     body_vel_b: {body_names: [L_Ankle, R_Ankle]}

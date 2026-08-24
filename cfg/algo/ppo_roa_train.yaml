@@ -1,0 +1,36 @@
+_target_: active_adaptation.learning.ppo.ppo_roa.PPOROA
+name: ppo_roa
+train_every: 32
+ppo_epochs: 3
+num_minibatches: 8
+clip_param: 0.2
+gamma: 0.99
+lmbda: 0.95
+enable_residual_distillation: true
+distill_with_priv_pred: false
+train_dr_estimator: false
+normalize_ratio: false
+lr: 0.0003
+desired_kl: 0.01
+entropy_coef_start: 0.001
+entropy_coef_end: 0.001
+entropy_decay_iters: 1000
+init_noise_scale: 1.0
+load_noise_scale: 0.5
+clip_neg_reward: false
+normalize_before_sum: false
+layer_norm: before
+value_norm: false
+adapt_module: mlp
+latent_dim: 256
+adapt_module_input_cmd: true
+max_grad_norm: 1.0
+clip_adv: null
+phase: train
+vecnorm: train
+checkpoint_path: null
+in_keys:
+  - command
+  - policy
+  - object
+  - priv
