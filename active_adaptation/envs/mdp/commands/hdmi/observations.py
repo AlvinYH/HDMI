@@ -42,11 +42,13 @@ class ref_joint_pos_action_policy(RobotTrackObservation):
         self.action_indices_motion = [self.command_manager.dataset.joint_names.index(joint_name) for joint_name in action_joint_names]
 
         self.action_scaling = action_manager.action_scaling
+        self.action_joint_ids = torch.as_tensor(action_manager.joint_ids, device=self.device)
         self.default_joint_pos = action_manager.default_joint_pos[:, action_manager.joint_ids]
 
     def compute(self):
         ref_joint_pos = self.command_manager.current_ref_motion.joint_pos[:, self.action_indices_motion]
-        ref_joint_action = (ref_joint_pos - self.default_joint_pos) / self.action_scaling
+        action_offset = self.env.action_manager.offset[:, self.action_joint_ids]
+        ref_joint_action = (ref_joint_pos - self.default_joint_pos - action_offset) / self.action_scaling
         return ref_joint_action
 
 class ref_root_pos_future_b(RobotTrackObservation):

@@ -503,13 +503,10 @@ ARTHOI4D_OBJECT_CFG = ArticulationCfg(
     init_state=ArticulationCfg.InitialStateCfg(
         pos=tuple(float(value) for value in INPUT["object_initial_root_pos"]),
         rot=tuple(float(value) for value in INPUT["object_initial_root_quat_wxyz"]),
-        joint_pos={
-            name: float(value)
-            for name, value in zip(
-                INPUT["object_joint_names"],
-                INPUT["object_initial_joint_qpos"],
-            )
-        },
+        # The command manager writes the complete q(t), qdot(t) state before
+        # every simulation reset.  This static spawn state is deliberately
+        # reference-phase independent.
+        joint_pos={".*": 0.0},
         joint_vel={".*": 0.0},
     ),
     actuators={

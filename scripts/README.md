@@ -40,3 +40,15 @@ python scripts/train.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpo
 # Evaluate Student
 python scripts/play.py algo=ppo_roa_finetune task=G1/hdmi/move_suitcase checkpoint_path=run:<student-wandb_run_path>
 ```
+## ArtHOI4D native rendering
+
+The direct ArtHOI4D integration is rendered from the same `hdmi_input.json`
+bundle used for training and export.  It does not use the historical
+`apply_adapter.py` / `ARTHOI4D_HDMI_INPUT_MANIFEST` protocol.
+
+Use the single `render_arthoi4d_rollout_frames.py` entry point for ordinary
+RGB rollout videos, RTX path tracing, and reference playback.  It derives the
+HDMI root from its own location and always writes PNG frames; pass
+`--output-video /path/to/rollout.mp4` to encode them into H.264 MP4 as part of
+the same command.  For path tracing, also pass
+`--rendering-mode pathtracing --pt-spp 32`.

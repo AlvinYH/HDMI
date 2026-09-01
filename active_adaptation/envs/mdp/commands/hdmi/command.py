@@ -197,6 +197,17 @@ class RobotTracking(Command):
 
         self.asset.write_joint_state_to_sim(init_joint_pos, init_joint_vel, env_ids=env_ids)
 
+        # Center position actions on the pose actually written at reset.  This
+        # keeps a zero action from pulling a randomly phased reference pose
+        # back toward the asset default pose.  The policy-side reference action
+        # is expressed in this same coordinate system.
+        action_manager = self.env.action_manager
+        action_joint_ids = torch.as_tensor(action_manager.joint_ids, device=self.device)
+        action_manager.offset[env_ids.unsqueeze(1), action_joint_ids] = (
+            init_joint_pos[:, action_joint_ids]
+            - action_manager.default_joint_pos[env_ids][:, action_joint_ids]
+        )
+
         if self.record_motion:
             if len(self.motion_frames) > 0:
                 self._save_motion()
@@ -346,7 +357,6 @@ class RobotObjectTracking(RobotTracking):
         object_body_name: str, # for the body that defines the contact target position
         object_joint_name: str | None = None, # object joint to track
         object_joint_names: List[str] | None = None,
-        object_reset_joint_pos: List[float] | None = None,
         # for reset
         object_pose_range: Dict[str, Tuple[float, float]] = {
             "x": (-0.0, 0.0),
@@ -391,12 +401,6 @@ class RobotObjectTracking(RobotTracking):
             self.object_joint_indices_asset = [
                 self.object.joint_names.index(name) for name in self.object_joint_names
             ]
-        if object_reset_joint_pos is not None and len(object_reset_joint_pos) != len(self.object_joint_names):
-            raise ValueError("object_reset_joint_pos must match object_joint_names")
-        self.object_reset_joint_pos = None if object_reset_joint_pos is None else torch.tensor(
-            object_reset_joint_pos, dtype=torch.float32, device=self.device
-        )
-        
         self.object_body_id_asset = self.object.body_names.index(object_body_name)
         self.object_body_id_motion = self.dataset.body_names.index(object_asset_name)
 
@@ -580,11 +584,12 @@ class RobotObjectTracking(RobotTracking):
         # print(f"Object initial position in robot frame: {object_pos_b}, orientation: {object_quat_b}")
 
         if self.object_joint_indices_asset is not None:
+            # Match upstream HDMI's random-phase semantics for every
+            # articulated object joint.  The upstream implementation used one
+            # joint; ARCTIC generalizes the same q(t), qdot(t) reset to all of
+            # the selected object joints.
             init_joint_pos = self._motion_reset.joint_pos[:, self.object_joint_indices_motion].clone()
             init_joint_vel = self._motion_reset.joint_vel[:, self.object_joint_indices_motion].clone()
-            if self.object_reset_joint_pos is not None:
-                init_joint_pos[:] = self.object_reset_joint_pos
-                init_joint_vel.zero_()
 
             joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
             joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise

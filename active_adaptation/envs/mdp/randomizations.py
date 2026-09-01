@@ -741,7 +741,9 @@ class random_joint_offset(Randomization):
 
     def reset(self, env_ids: torch.Tensor):
         offset = uniform(self.offset_range[env_ids, :, 0], self.offset_range[env_ids, :, 1])
-        self.action_manager.offset[env_ids.unsqueeze(1), self.joint_ids] = offset
+        # Preserve the reference-pose action center set by RobotTracking while
+        # adding the sampled actuator-target perturbation.
+        self.action_manager.offset[env_ids.unsqueeze(1), self.joint_ids] += offset
 
 
 class random_pull(Randomization):

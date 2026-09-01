@@ -26,15 +26,13 @@ command:
   data_path: ${oc.env:ARTHOI4D_HDMI_MOTION_DIR}
   tracking_keypoint_names: [".*"]
   tracking_joint_names: [".*"]
-  root_body_name: Pelvis
-  reset_range: [0, 1]
+  root_body_name: Chest
   object_asset_name: arthoi4d_object
   object_body_name: ${oc.env:ARTHOI4D_HDMI_OBJECT_BODY}
   contact_target_body_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_BODY_NAMES}}
   contact_target_pos_offset: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_POS_OFFSETS}}
   contact_region_link_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_REGION_LINK_NAMES}}
   object_joint_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_JOINT_NAMES}}
-  object_reset_joint_pos: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_INITIAL_QPOS}}
   pose_range:
     x: [0.0, 0.0]
     y: [0.0, 0.0]
