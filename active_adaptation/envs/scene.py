@@ -18,6 +18,11 @@ if active_adaptation.get_backend() == "isaac":
         else:
             raise RuntimeError("Simulation context already exists. Cannot create a new one.")
         scene = InteractiveScene(scene_cfg)
+        # USD cloning does not install PhysX collision groups.  Keep every
+        # cloned environment isolated while preserving collisions with the
+        # shared ground plane.
+        if not scene_cfg.replicate_physics and scene_cfg.filter_collisions:
+            scene.filter_collisions(global_prim_paths=["/World/ground"])
         if before_first_step is not None:
             before_first_step(scene)
         if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
@@ -29,4 +34,3 @@ elif active_adaptation.get_backend() == "mujoco":
     pass
 else:
     raise NotImplementedError
-
