@@ -43,10 +43,12 @@ class ref_joint_pos_action_policy(RobotTrackObservation):
 
         self.action_scaling = action_manager.action_scaling
         self.default_joint_pos = action_manager.default_joint_pos[:, action_manager.joint_ids]
+        self.action_manager = action_manager
 
     def compute(self):
         ref_joint_pos = self.command_manager.current_ref_motion.joint_pos[:, self.action_indices_motion]
-        ref_joint_action = (ref_joint_pos - self.default_joint_pos) / self.action_scaling
+        ref_joint_pos_offset = self.action_manager.offset[:, self.action_manager.joint_ids]
+        ref_joint_action = (ref_joint_pos - self.default_joint_pos - ref_joint_pos_offset) / self.action_scaling
         return ref_joint_action
 
 class ref_root_pos_future_b(RobotTrackObservation):

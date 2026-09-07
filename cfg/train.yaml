@@ -16,6 +16,7 @@ total_frames: 150_000_000
 eval_render: false
 save_interval: 300
 seed: 0
+debug_metrics_interval: 1
 checkpoint_path: null
 vecnorm: ${oc.select:algo.vecnorm,train}
 

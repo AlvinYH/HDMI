@@ -307,6 +307,8 @@ class _Env(EnvBase):
 
         self.termination_funcs = OrderedDict()
         for key, params in self.cfg.termination.items():
+            if params is None:
+                continue
             term_cls = mdp.Termination.registry[key]
             term_func = term_cls(env=self, **params)
             self.termination_funcs[key] = term_func
