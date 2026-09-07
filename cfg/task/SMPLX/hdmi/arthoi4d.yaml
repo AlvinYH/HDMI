@@ -16,7 +16,7 @@ robot:
   contact_body_name: Pelvis
 
 action:
-  action_scaling_replace: 0.25
+  action_scaling_replace: 0.75
   # Do not delay policy outputs beyond the common 30 Hz action boundary.
   min_delay: 0
   max_delay: 0
@@ -97,8 +97,23 @@ reward:
     tracking_root_ori(keypoint_ori_tracking_product): {body_names: [Pelvis]}
     tracking_body_linvel(keypoint_lin_vel_tracking_product): {body_names: [".*"]}
     tracking_body_angvel(keypoint_ang_vel_tracking_product): {body_names: [".*"]}
-    joint_pos_tracking_product: {joint_names: [".*"]}
-    joint_vel_tracking_product: {joint_names: [".*"]}
+    # SMPL-X has many finger/toe DOFs that have no direct HDMI-G1 analogue.
+    # Keep the main locomotion/arm joints dominant while retaining a small
+    # gradient for the remaining anatomy.
+    joint_pos_tracking_product:
+      joint_names: [".*"]
+      joint_weights:
+        ".*": 0.05
+        ".*_(Hip|Knee|Ankle|Shoulder|Elbow|Wrist)_.*": 1.0
+        ".*_?(Index|Middle|Pinky|Ring|Thumb).*": 0.02
+        ".*_Toe_.*": 0.02
+    joint_vel_tracking_product:
+      joint_names: [".*"]
+      joint_weights:
+        ".*": 0.05
+        ".*_(Hip|Knee|Ankle|Shoulder|Elbow|Wrist)_.*": 1.0
+        ".*_?(Index|Middle|Pinky|Ring|Thumb).*": 0.02
+        ".*_Toe_.*": 0.02
   object_tracking:
     object_joint_pos_tracking: {weight: 1.0, sigma: 0.5}
   feet:
@@ -123,7 +138,10 @@ randomization:
   random_joint_offset: null
 
 termination:
-  cum_body_pos_error: {body_names: Torso}
-  cum_body_ori_error: {body_names: Torso}
-  cum_body_pos_error_local: {body_names: ".*"}
-  cum_body_ori_error_local: {body_names: ".*"}
+  cum_body_pos_error: {body_names: Torso, min_steps: 1000}
+  cum_body_ori_error: {body_names: Torso, min_steps: 1000}
+  cum_body_pos_error_local: {body_names: ".*", min_steps: 1000}
+  cum_body_ori_error_local: {body_names: ".*", min_steps: 1000}
+  cum_object_pos_error: {min_steps: 1000}
+  cum_object_ori_error: {min_steps: 1000}
+  cum_lost_contact_steps: {min_steps: 1000}

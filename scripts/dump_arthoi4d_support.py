@@ -3,11 +3,39 @@
 from __future__ import annotations
 
 import json
+import os
+from pathlib import Path
+import sys
 
 import hydra
 from omegaconf import OmegaConf
 
 from isaaclab.app import AppLauncher
+
+
+def _input_bundle() -> dict:
+    path_value = os.environ.get("ARTHOI4D_HDMI_INPUT_PATH")
+    if not path_value:
+        raise RuntimeError("ARTHOI4D_HDMI_INPUT_PATH is required")
+    path = Path(path_value).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"HDMI input bundle is missing: {path}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _seed_hdmi_environment(bundle: dict) -> None:
+    input_root = Path(os.environ["ARTHOI4D_HDMI_INPUT_PATH"]).expanduser().resolve().parent
+    os.environ.setdefault("ARTHOI4D_HDMI_MOTION_DIR", str(input_root / bundle["motion_dir"]))
+    os.environ.setdefault("ARTHOI4D_HDMI_OBJECT_BODY", str(bundle["object_body_names"][0]))
+    os.environ.setdefault("ARTHOI4D_HDMI_CONTACT_TARGET_BODY_NAMES", json.dumps(bundle["contact_target_body_names"]))
+    os.environ.setdefault("ARTHOI4D_HDMI_CONTACT_TARGET_POS_OFFSETS", json.dumps(bundle["contact_target_pos_offsets"]))
+    os.environ.setdefault("ARTHOI4D_HDMI_CONTACT_REGION_LINK_NAMES", json.dumps(bundle["contact_region_link_names"]))
+    os.environ.setdefault("ARTHOI4D_HDMI_OBJECT_JOINT_NAMES", json.dumps(bundle["object_joint_names"]))
+    os.environ.setdefault("ARTHOI4D_HDMI_OBJECT_INITIAL_QPOS", json.dumps(bundle["object_initial_joint_qpos"]))
+    os.environ.setdefault(
+        "ARTHOI4D_HDMI_SUPPORT_NAMES",
+        json.dumps([f"arthoi4d_support_{index}" for index in range(len(bundle["support_boxes"]))]),
+    )
 
 
 def _float_rows(value) -> list[list[float]]:
@@ -53,13 +81,17 @@ def _cuboid_size(stage, root_path: str) -> list[float]:
     ]
 
 
-@hydra.main(config_path="../cfg", config_name="train", version_base=None)
+@hydra.main(config_path="../cfg", config_name="eval", version_base=None)
 def main(cfg) -> None:
     """Reuse HDMI's standard task configuration with exactly one environment."""
 
     OmegaConf.set_struct(cfg, False)
+    _seed_hdmi_environment(_input_bundle())
     cfg.headless = True
+    cfg.eval_render = False
+    cfg.app.enable_cameras = False
     cfg.task.num_envs = 1
+    print("[arthoi4d-support] stage=app-launch", flush=True)
     app_launcher = AppLauncher(OmegaConf.to_container(cfg.app, resolve=True))
     simulation_app = app_launcher.app
     env = None
@@ -68,9 +100,11 @@ def main(cfg) -> None:
             ARTHOI4D_HAND_COLLISION_GROUP_PATH,
             ARTHOI4D_TABLE_COLLISION_GROUP_PATH,
         )
-        from active_adaptation.envs import SimpleEnv
+        from scripts.helpers import make_env_policy
 
-        env = SimpleEnv(cfg.task)
+        print("[arthoi4d-support] stage=make_env", flush=True)
+        env, _, _ = make_env_policy(cfg)
+        print("[arthoi4d-support] stage=env-ready", flush=True)
         stage = env.scene.stage
         supports: dict[str, object] = {}
         for name in cfg.task.static_support_names:
@@ -90,7 +124,10 @@ def main(cfg) -> None:
                 "hands": _collision_group(stage, ARTHOI4D_HAND_COLLISION_GROUP_PATH),
             },
         }
+        print("[arthoi4d-support] stage=report-ready", flush=True)
         print(json.dumps(report, indent=2, sort_keys=True))
+        sys.stdout.flush()
+        os._exit(0)
     finally:
         if env is not None:
             env.close()

@@ -35,14 +35,32 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
-    
+
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
+    app_cfg = OmegaConf.to_container(cfg.app, resolve=True)
+    asset_root = os.environ.get("ARTHOI4D_HDMI_ASSET_ROOT")
+    if asset_root:
+        # IsaacLab snapshots the asset-root setting when its asset utilities
+        # are imported. Pass it to Kit before AppLauncher starts, rather than
+        # mutating carb settings after the snapshot may already exist.
+        kit_args = str(app_cfg.get("kit_args", "")).strip()
+        app_cfg["kit_args"] = (
+            f"{kit_args} --/persistent/isaac/asset_root/cloud={asset_root}"
+        ).strip()
+        print(f"Using HDMI Isaac asset root: {asset_root}")
     app_launcher = AppLauncher(
-        OmegaConf.to_container(cfg.app, resolve=True),
+        app_cfg,
         distributed=aa.is_distributed(),
         device=f"cuda:{aa.get_local_rank()}"
     )
     simulation_app = app_launcher.app
+
+    if asset_root:
+        import carb
+
+        carb.settings.get_settings().set(
+            "/persistent/isaac/asset_root/cloud", asset_root
+        )
 
     run = wandb.init(
         job_type=cfg.wandb.job_type,
@@ -57,18 +75,21 @@ def main(cfg: DictConfig):
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 
-    os.makedirs(run.dir, exist_ok=True)
-    cfg_save_path = os.path.join(run.dir, "cfg.yaml")
+    # W&B disabled mode uses a temporary run directory.  Keep all durable
+    # artifacts in Hydra's explicitly requested output directory instead.
+    run_dir = os.getcwd()
+    os.makedirs(run_dir, exist_ok=True)
+    cfg_save_path = os.path.join(run_dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")
-    run.save(os.path.join(run.dir, "config.yaml"), policy="now")
+    run.save(os.path.join(run_dir, "config.yaml"), policy="now")
 
     env, policy, vecnorm = make_env_policy(cfg)
 
     import inspect
     import shutil
     source_path = inspect.getfile(policy.__class__)
-    target_path = os.path.join(run.dir, source_path.split("/")[-1])
+    target_path = os.path.join(run_dir, source_path.split("/")[-1])
     shutil.copy(source_path, target_path)
     wandb.save(target_path, policy="now")
 
@@ -88,7 +109,7 @@ def main(cfg: DictConfig):
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
     def save(policy, checkpoint_name: str, artifact: bool=False):
-        ckpt_path = os.path.join(run.dir, f"{checkpoint_name}.pt")
+        ckpt_path = os.path.join(run_dir, f"{checkpoint_name}.pt")
         state_dict = OrderedDict()
         state_dict["wandb"] = {"name": run.name, "id": run.id}
         state_dict["policy"] = policy.state_dict()
@@ -104,7 +125,7 @@ def main(cfg: DictConfig):
             )
             artifact.add_file(ckpt_path)
             run.log_artifact(artifact)
-        run.save(ckpt_path, policy="now", base_path=run.dir)
+        run.save(ckpt_path, policy="now", base_path=run_dir)
         logging.info(f"Saved checkpoint to {str(ckpt_path)}")
 
     assert env.training

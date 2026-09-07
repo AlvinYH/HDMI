@@ -146,7 +146,7 @@ def make_env_policy(cfg: DictConfig):
     vecnorm = VecNorm(obs_keys, decay=0.9999)
     vecnorm(base_env.fake_tensordict())
 
-    if "vecnorm" in state_dict.keys():
+    if cfg.vecnorm is not None and "vecnorm" in state_dict.keys():
         print(colored("[Info]: Load VecNorm from checkpoint.", "green"))
         vecnorm.load_state_dict(state_dict["vecnorm"])
     if cfg.vecnorm == "train":
@@ -270,7 +270,9 @@ def evaluate(
         time_str = datetime.datetime.now().strftime("%m-%d_%H-%M")
         video_array = np.stack(frames)
         frames.clear()
-        video_path = os.path.join(os.path.dirname(__file__), f"recording-{time_str}.mp4")
+        record_dir = os.environ.get("HDMI_RECORD_DIR", os.path.dirname(__file__))
+        os.makedirs(record_dir, exist_ok=True)
+        video_path = os.path.join(record_dir, f"recording-{time_str}.mp4")
         imageio.mimwrite(
             video_path,
             video_array,

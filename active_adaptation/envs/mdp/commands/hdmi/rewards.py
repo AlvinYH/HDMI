@@ -2,6 +2,7 @@ from active_adaptation.envs.mdp.commands.hdmi.command import RobotTracking, Robo
 from active_adaptation.envs.mdp.base import Reward as BaseReward
 
 from typing import List, Dict, Tuple
+import re
 from omegaconf import DictConfig, ListConfig
 from isaaclab.utils.string import resolve_matching_names, resolve_matching_names_values
 from isaaclab.utils.math import quat_apply_inverse, quat_mul, quat_conjugate, axis_angle_from_quat, yaw_quat
@@ -262,7 +263,9 @@ class keypoint_ang_vel_tracking_product(_tracking_keypoint):
         return torch.exp(- error.mean(dim=1) / self.sigma).unsqueeze(1)
 
 class _tracking_joint(TrackReward):
-    def __init__(self, joint_names: List[str] | str | None = None, sigma: float = 0.03, tolerance: float | Dict[str, float] = 0.0, **kwargs):
+    def __init__(self, joint_names: List[str] | str | None = None, sigma: float = 0.03,
+                 tolerance: float | Dict[str, float] = 0.0,
+                 joint_weights: float | Dict[str, float] = 1.0, **kwargs):
         super().__init__(**kwargs)
         if joint_names is None:
             joint_names = self.command_manager.tracking_joint_names
@@ -295,6 +298,25 @@ class _tracking_joint(TrackReward):
         else:
             raise ValueError(f"Invalid tolerance type: {type(tolerance)}")
 
+        self.joint_weights = torch.ones(len(self.joint_names), device=self.env.device)
+        if isinstance(joint_weights, (float, int)):
+            self.joint_weights.fill_(float(joint_weights))
+        elif isinstance(joint_weights, (dict, DictConfig)):
+            # Unlike tolerance, weights deliberately support an all-joints
+            # default followed by increasingly specific overrides.
+            for pattern, value in dict(joint_weights).items():
+                matched_indices = [
+                    index for index, name in enumerate(self.joint_names)
+                    if re.fullmatch(pattern, name)
+                ]
+                if matched_indices:
+                    self.joint_weights[matched_indices] = float(value)
+        else:
+            raise ValueError(f"Invalid joint_weights type: {type(joint_weights)}")
+        if (self.joint_weights < 0).any() or not torch.isfinite(self.joint_weights).all():
+            raise ValueError("joint_weights must be finite and non-negative")
+        self.joint_weight_sum = self.joint_weights.sum().clamp_min(1e-8)
+
 class joint_pos_tracking_product(_tracking_joint):
     def compute(self):
         joint_pos_asset = self.command_manager.asset.data.joint_pos[:, self.joint_indices_asset]
@@ -302,7 +324,8 @@ class joint_pos_tracking_product(_tracking_joint):
         diff = joint_pos_motion - joint_pos_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
         # shape: [num_envs, num_tracking_joints]
-        return torch.exp(- error.mean(dim=1) / self.sigma).unsqueeze(1)
+        weighted_error = (error * self.joint_weights).sum(dim=1) / self.joint_weight_sum
+        return torch.exp(- weighted_error / self.sigma).unsqueeze(1)
     
 class joint_pos_error(_tracking_joint):
     def compute(self):
@@ -310,7 +333,8 @@ class joint_pos_error(_tracking_joint):
         joint_pos_motion = self.command_manager.ref_joint_pos[:, self.joint_indices_motion]
         diff = joint_pos_motion - joint_pos_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
-        return error.mean(dim=1).unsqueeze(1)
+        weighted_error = (error * self.joint_weights).sum(dim=1) / self.joint_weight_sum
+        return weighted_error.unsqueeze(1)
     
 class joint_vel_tracking_product(_tracking_joint):
     def compute(self):
@@ -319,7 +343,8 @@ class joint_vel_tracking_product(_tracking_joint):
         diff = joint_vel_motion - joint_vel_asset
         error = (diff.abs() - self.tolerance).clamp_min(0.0)
         # shape: [num_envs, num_tracking_joints]
-        return torch.exp(- error.mean(dim=1) / self.sigma).unsqueeze(1)
+        weighted_error = (error * self.joint_weights).sum(dim=1) / self.joint_weight_sum
+        return torch.exp(- weighted_error / self.sigma).unsqueeze(1)
 
 RobotObjectTrackReward = BaseReward[RobotObjectTracking]
 
@@ -488,5 +513,3 @@ class eef_contact_all(RobotObjectTrackReward):
         rew = (rew * self.in_range.float() * self.gain + 1 - self.in_range.float()).mean(dim=-1)
         # shape: [num_envs]
         return rew.unsqueeze(-1)
-
-

@@ -13,13 +13,6 @@ from isaaclab.actuators import ImplicitActuatorCfg
 from isaaclab.assets.articulation import ArticulationCfg
 from isaaclab.assets.rigid_object import RigidObjectCfg
 from isaaclab.terrains import TerrainImporterCfg
-from isaacsim.core.utils.extensions import enable_extension
-from isaaclab.sim.converters import (
-    MjcfConverter,
-    MjcfConverterCfg,
-    UrdfConverter,
-    UrdfConverterCfg,
-)
 from pxr import Sdf, Usd, UsdPhysics
 
 
@@ -99,27 +92,6 @@ def _patch_object_urdf(urdf_path: Path) -> Path:
     tree = ET.parse(urdf_path)
     root = tree.getroot()
 
-    child_links: set[str] = set()
-    root_has_child = False
-    first_joint_parent: str | None = None
-    for joint in root.findall("joint"):
-        parent = joint.find("parent")
-        child = joint.find("child")
-        parent_link = parent.get("link") if parent is not None else None
-        child_link = child.get("link") if child is not None else None
-        if parent_link == "base":
-            root_has_child = True
-        if child_link:
-            child_links.add(child_link)
-        if first_joint_parent is None and parent_link and parent_link != "base":
-            first_joint_parent = parent_link
-
-    if not root_has_child and first_joint_parent and first_joint_parent not in child_links:
-        joint = ET.Element("joint", {"name": f"base_to_{first_joint_parent}", "type": "fixed"})
-        ET.SubElement(joint, "parent", {"link": "base"})
-        ET.SubElement(joint, "child", {"link": first_joint_parent})
-        root.insert(1, joint)
-
     scoped_counts: dict[tuple[str, str], dict[str, int]] = {}
     for link in root.findall("link"):
         link_name = link.get("name", "link")
@@ -144,46 +116,99 @@ def _patch_object_urdf(urdf_path: Path) -> Path:
 
 INPUT, INPUT_ROOT = _input()
 CACHE = (INPUT_ROOT / INPUT["usd_cache_dir"]).resolve()
+# A torchrun job starts one Isaac process per rank.  Keep generated USD files
+# rank-local on first conversion so the workers never race while creating the
+# same cache.  Single-process HDMI retains the existing cache location.
+if os.environ.get("ARTHOI4D_HDMI_USD_CACHE_PER_RANK", "0").lower() in {
+    "1",
+    "true",
+    "yes",
+}:
+    CACHE = CACHE / f"rank{int(os.environ.get('LOCAL_RANK', '0'))}"
 CACHE.mkdir(parents=True, exist_ok=True)
-enable_extension("isaacsim.asset.importer.mjcf")
+
+
+def _human_mjcf_without_floor(source: Path) -> Path:
+    """Keep the shared Isaac terrain as the only ground-plane actor."""
+
+    tree = ET.parse(source)
+    worldbody = tree.find("worldbody")
+    if worldbody is None:
+        raise ValueError(f"SMPL-X MJCF has no worldbody: {source}")
+    for geom in list(worldbody.findall("geom")):
+        if geom.get("type") == "plane" or geom.get("name") == "floor":
+            worldbody.remove(geom)
+    destination = CACHE / "human" / f"{source.stem}_arthoi4d_nofloor.xml"
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    ET.indent(tree, space="  ")
+    tree.write(destination, encoding="utf-8", xml_declaration=True)
+    return destination
+
+
 WORLD = INPUT["world"]
 GROUND = WORLD["ground"]
 MATERIALS = WORLD["materials"]
 PHYSX = WORLD["physx"]
 OBJECT = WORLD["object"]
 
-human_usd = MjcfConverter(
-    MjcfConverterCfg(
-        asset_path=str((INPUT_ROOT / INPUT["human_mjcf"]).resolve()),
-        usd_dir=str(CACHE / "human"),
-        usd_file_name="smplx.usd",
-        fix_base=False,
-        self_collision=False,
-        make_instanceable=True,
-    )
-).usd_path
+human_usd_cache = CACHE / "human" / "smplx.usd"
+object_usd_cache = CACHE / "object" / "object.usd"
+reuse_usd_cache = os.environ.get("ARTHOI4D_HDMI_REUSE_USD_CACHE", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
-object_urdf = _patch_object_urdf((INPUT_ROOT / INPUT["object_urdf"]).resolve())
+if reuse_usd_cache and human_usd_cache.is_file() and object_usd_cache.is_file():
+    human_usd = str(human_usd_cache)
+    object_usd = str(object_usd_cache)
+else:
+    if reuse_usd_cache:
+        missing = [
+            str(path)
+            for path in (human_usd_cache, object_usd_cache)
+            if not path.is_file()
+        ]
+        raise FileNotFoundError(
+            "ARTHOI4D_HDMI_REUSE_USD_CACHE=1 but USD cache is incomplete: "
+            + ", ".join(missing)
+        )
+    from isaaclab.sim.converters import MjcfConverter, MjcfConverterCfg, UrdfConverter, UrdfConverterCfg
+    from isaacsim.core.utils.extensions import enable_extension
 
-object_usd = UrdfConverter(
-    UrdfConverterCfg(
-        asset_path=str(object_urdf),
-        usd_dir=str(CACHE / "object"),
-        usd_file_name="object.usd",
-        fix_base=bool(INPUT["object_fix_base"]),
-        root_link_name=INPUT["object_body_names"][0],
-        merge_fixed_joints=False,
-        self_collision=False,
-        make_instanceable=True,
-        joint_drive=UrdfConverterCfg.JointDriveCfg(
-            target_type="none",
-            gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
-                stiffness=0.0,
-                damping=0.0,
+    enable_extension("isaacsim.asset.importer.mjcf")
+    human_usd = MjcfConverter(
+        MjcfConverterCfg(
+            asset_path=str(_human_mjcf_without_floor((INPUT_ROOT / INPUT["human_mjcf"]).resolve())),
+            usd_dir=str(CACHE / "human"),
+            usd_file_name="smplx.usd",
+            fix_base=False,
+            self_collision=False,
+            make_instanceable=True,
+        )
+    ).usd_path
+
+    object_urdf = _patch_object_urdf((INPUT_ROOT / INPUT["object_urdf"]).resolve())
+
+    object_usd = UrdfConverter(
+        UrdfConverterCfg(
+            asset_path=str(object_urdf),
+            usd_dir=str(CACHE / "object"),
+            usd_file_name="object.usd",
+            fix_base=bool(INPUT["object_fix_base"]),
+            root_link_name=INPUT["object_body_names"][0],
+            merge_fixed_joints=False,
+            self_collision=False,
+            make_instanceable=True,
+            joint_drive=UrdfConverterCfg.JointDriveCfg(
+                target_type="none",
+                gains=UrdfConverterCfg.JointDriveCfg.PDGainsCfg(
+                    stiffness=0.0,
+                    damping=0.0,
+                ),
             ),
-        ),
-    )
-).usd_path
+        )
+    ).usd_path
 
 
 def _rigid_body_prim_paths(
@@ -385,7 +410,12 @@ ARTHOI4D_HAND_COLLISION_GROUP_PATH = (
 )
 
 
-def _collision_prim_paths(stage: Usd.Stage, root_path: str) -> list[Sdf.Path]:
+def _collision_prim_paths(
+    stage: Usd.Stage,
+    root_path: str,
+    *,
+    allow_empty: bool = False,
+) -> list[Sdf.Path]:
     """Return every collider below one spawned rigid body."""
 
     root = stage.GetPrimAtPath(root_path)
@@ -396,7 +426,7 @@ def _collision_prim_paths(stage: Usd.Stage, root_path: str) -> list[Sdf.Path]:
         for prim in Usd.PrimRange(root)
         if prim.HasAPI(UsdPhysics.CollisionAPI)
     ]
-    if not paths:
+    if not paths and not allow_empty:
         raise RuntimeError(f"ARCTIC collision root has no collider: {root_path}")
     return paths
 
@@ -405,7 +435,11 @@ def _set_collision_group_targets(
     group: UsdPhysics.CollisionGroup,
     targets: list[Sdf.Path],
 ) -> None:
-    group.CreateIncludesRel().SetTargets(list(dict.fromkeys(targets)))
+    prim = group.GetPrim()
+    includes = prim.GetRelationship("includes")
+    if not includes:
+        includes = prim.CreateRelationship("includes")
+    includes.SetTargets(list(dict.fromkeys(targets)))
 
 
 def apply_arthoi4d_table_collision_filter(scene) -> None:
@@ -445,7 +479,11 @@ def apply_arthoi4d_table_collision_filter(scene) -> None:
         for body_name in _CODA_FILTERED_HAND_BODIES:
             body_path = ARTHOI4D_ROBOT_BODY_PRIM_PATHS[body_name]
             hand_targets.extend(
-                _collision_prim_paths(stage, f"{env_path}/Robot/{body_path}")
+                _collision_prim_paths(
+                    stage,
+                    f"{env_path}/Robot/{body_path}",
+                    allow_empty=True,
+                )
             )
     _set_collision_group_targets(table_group, table_targets)
     _set_collision_group_targets(hand_group, hand_targets)
@@ -454,13 +492,12 @@ def apply_arthoi4d_table_collision_filter(scene) -> None:
 
 ARTHOI4D_SMPLX_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
-    articulation_root_prim_path=f"/{INPUT['human_body_names'][0]}",
+    articulation_root_prim_path=f"/{INPUT['human_body_names'][0]}/{INPUT['human_body_names'][0]}",
     spawn=sim_utils.UsdFileCfg(
         usd_path=human_usd,
         activate_contact_sensors=True,
         rigid_props=_rigid_props,
         collision_props=_matched_collision,
-        physics_material=_matched_material,
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=int(PHYSX["num_position_iterations"]),
@@ -492,7 +529,6 @@ ARTHOI4D_OBJECT_CFG = ArticulationCfg(
         activate_contact_sensors=True,
         rigid_props=_object_rigid_props,
         collision_props=_matched_collision,
-        physics_material=_matched_material,
         articulation_props=sim_utils.ArticulationRootPropertiesCfg(
             enabled_self_collisions=False,
             solver_position_iteration_count=int(PHYSX["num_position_iterations"]),

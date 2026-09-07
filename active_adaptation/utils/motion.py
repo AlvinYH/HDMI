@@ -103,21 +103,30 @@ def slerp(ts_target, ts_source, quat):
 def interpolate(motion, source_fps: int, target_fps: int):
     if source_fps != target_fps:
         in_keys = ["body_pos_w", "body_lin_vel_w", "body_quat_w", "body_ang_vel_w", "joint_pos", "joint_vel"]
-        extra_keys = set(motion.keys()) - set(in_keys)
+        # ARCTIC supplies this per-link boolean contact label alongside the
+        # kinematic tensors. Keep it on the resampled timeline with nearest
+        # neighbour sampling; MotionDataset does not otherwise consume it.
+        discrete_keys = {"object_contact"}
+        extra_keys = set(motion.keys()) - set(in_keys) - discrete_keys
         if extra_keys:
             raise NotImplementedError(f"interpolation is not fully implemented for keys: {extra_keys}")
         T = motion["joint_pos"].shape[0]
-        end_t = T / source_fps
-        ts_source = np.arange(0, end_t, 1 / source_fps)
-        ts_target = np.arange(0, end_t, 1 / target_fps)
-        if ts_target[-1] > ts_source[-1]:
-            ts_target = ts_target[:-1]
+        # Samples are timestamped from 0 through (T - 1) / source_fps.
+        # Filtering rather than removing one endpoint avoids floating-point
+        # rounding leaving a target time outside SciPy Slerp's valid range.
+        ts_source = np.arange(T, dtype=float) / source_fps
+        ts_target = np.arange(0.0, ts_source[-1] + 1.0 / target_fps, 1.0 / target_fps)
+        ts_target = ts_target[ts_target <= ts_source[-1] + 1.0e-9]
         motion["body_pos_w"] = lerp(ts_target, ts_source, motion["body_pos_w"].reshape(T, -1)).reshape(len(ts_target), -1, 3)
         motion["body_lin_vel_w"] = lerp(ts_target, ts_source, motion["body_lin_vel_w"].reshape(T, -1)).reshape(len(ts_target), -1, 3)
         motion["body_quat_w"] = slerp(ts_target, ts_source, motion["body_quat_w"])
         motion["body_ang_vel_w"] = lerp(ts_target, ts_source, motion["body_ang_vel_w"].reshape(T, -1)).reshape(len(ts_target), -1, 3)
         motion["joint_pos"] = lerp(ts_target, ts_source, motion["joint_pos"])
         motion["joint_vel"] = lerp(ts_target, ts_source, motion["joint_vel"])
+        for key in discrete_keys.intersection(motion):
+            source_idx = np.rint(ts_target * source_fps).astype(int)
+            source_idx = np.clip(source_idx, 0, T - 1)
+            motion[key] = motion[key][source_idx]
     return motion
 
 def quat_to_angular_velocity(quat: torch.Tensor, fps: float) -> torch.Tensor:

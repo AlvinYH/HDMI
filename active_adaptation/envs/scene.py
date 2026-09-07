@@ -18,6 +18,11 @@ if active_adaptation.get_backend() == "isaac":
         else:
             raise RuntimeError("Simulation context already exists. Cannot create a new one.")
         scene = InteractiveScene(scene_cfg)
+        # Original HDMI uses USD cloning (replicate_physics=False), for which
+        # IsaacLab requires an explicit per-environment PhysX collision filter.
+        # Keep the shared ground enabled after isolating env_i from env_j.
+        if not scene_cfg.replicate_physics and scene_cfg.filter_collisions:
+            scene.filter_collisions(global_prim_paths=["/World/ground"])
         if before_first_step is not None:
             before_first_step(scene)
         if builtins.ISAAC_LAUNCHED_FROM_TERMINAL is False:
@@ -29,4 +34,3 @@ elif active_adaptation.get_backend() == "mujoco":
     pass
 else:
     raise NotImplementedError
-
