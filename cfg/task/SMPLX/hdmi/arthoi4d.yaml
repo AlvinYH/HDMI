@@ -138,10 +138,7 @@ randomization:
   random_joint_offset: null
 
 termination:
-  cum_body_pos_error: {body_names: Torso, min_steps: 1000}
-  cum_body_ori_error: {body_names: Torso, min_steps: 1000}
-  cum_body_pos_error_local: {body_names: ".*", min_steps: 1000}
-  cum_body_ori_error_local: {body_names: ".*", min_steps: 1000}
-  cum_object_pos_error: {min_steps: 1000}
-  cum_object_ori_error: {min_steps: 1000}
-  cum_lost_contact_steps: {min_steps: 1000}
+  cum_body_pos_error: {body_names: Torso}
+  cum_body_ori_error: {body_names: Torso}
+  cum_body_pos_error_local: {body_names: ".*"}
+  cum_body_ori_error_local: {body_names: ".*"}

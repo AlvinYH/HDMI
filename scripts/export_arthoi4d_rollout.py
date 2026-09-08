@@ -139,6 +139,17 @@ def _stack(frames: list[dict[str, torch.Tensor]]) -> dict[str, np.ndarray]:
     return payload
 
 
+def _require_finite(name: str, value: torch.Tensor, step: int) -> None:
+    finite = torch.isfinite(value)
+    if finite.all():
+        return
+    first_index = torch.nonzero(~finite, as_tuple=False)[0].detach().cpu().tolist()
+    raise RuntimeError(
+        f"Native HDMI rollout became non-finite at step {step}: "
+        f"{name}{tuple(first_index)}={value[tuple(first_index)].item()}"
+    )
+
+
 def _float_rows(value) -> list[list[float]]:
     return value.detach().cpu().tolist()
 
@@ -287,6 +298,7 @@ def main(cfg: DictConfig) -> None:
         )
         if max_steps <= 0:
             raise ValueError("rollout_steps must be positive")
+        fixed_horizon = bool(cfg.get("fixed_horizon", False))
         policy_eval = policy.get_rollout_policy("eval")
         env.base_env.eval()
         env.eval()
@@ -296,11 +308,15 @@ def main(cfg: DictConfig) -> None:
         print("[arthoi4d-export] stage=reset-ok", flush=True)
         frames: list[dict[str, torch.Tensor]] = []
         with torch.inference_mode(), set_exploration_type(ExplorationType.MODE):
-            for _ in range(max_steps):
+            for step in range(max_steps):
                 action_tensordict = policy_eval(tensordict)
+                _require_finite("policy_action", action_tensordict["action"], step)
                 transition = env.step(action_tensordict)
-                frames.append(_snapshot(command, bundle, human_body_ids, human_joint_ids))
-                if bool(transition["next", "done"][0].item()):
+                frame = _snapshot(command, bundle, human_body_ids, human_joint_ids)
+                for name, value in frame.items():
+                    _require_finite(name, value, step)
+                frames.append(frame)
+                if bool(transition["next", "done"][0].item()) and not fixed_horizon:
                     break
                 tensordict = transition["next"]
 
