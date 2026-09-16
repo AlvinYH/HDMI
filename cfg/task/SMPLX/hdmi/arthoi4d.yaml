@@ -8,6 +8,10 @@ terrain: arthoi4d_plane
 num_envs: 4096
 max_episode_length: 1000
 
+sim:
+  # IsaacLab scene replication is part of the ArtHOI4D training contract.
+  replicate_physics: true
+
 static_support_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_SUPPORT_NAMES}}
 
 robot:
@@ -16,7 +20,7 @@ robot:
   contact_body_name: Pelvis
 
 action:
-  action_scaling_replace: 0.75
+  action_scaling_replace: 0.25
   # Do not delay policy outputs beyond the common 30 Hz action boundary.
   min_delay: 0
   max_delay: 0
@@ -27,14 +31,13 @@ command:
   tracking_keypoint_names: [".*"]
   tracking_joint_names: [".*"]
   root_body_name: Pelvis
-  reset_range: [0, 1]
+  reset_range: null
   object_asset_name: arthoi4d_object
   object_body_name: ${oc.env:ARTHOI4D_HDMI_OBJECT_BODY}
   contact_target_body_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_BODY_NAMES}}
   contact_target_pos_offset: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_TARGET_POS_OFFSETS}}
   contact_region_link_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_CONTACT_REGION_LINK_NAMES}}
   object_joint_names: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_JOINT_NAMES}}
-  object_reset_joint_pos: ${oc.decode:${oc.env:ARTHOI4D_HDMI_OBJECT_INITIAL_QPOS}}
   pose_range:
     x: [0.0, 0.0]
     y: [0.0, 0.0]
@@ -138,10 +141,10 @@ randomization:
   random_joint_offset: null
 
 termination:
-  cum_body_pos_error: {body_names: Torso, min_steps: 1000}
-  cum_body_ori_error: {body_names: Torso, min_steps: 1000}
-  cum_body_pos_error_local: {body_names: ".*", min_steps: 1000}
-  cum_body_ori_error_local: {body_names: ".*", min_steps: 1000}
-  cum_object_pos_error: {min_steps: 1000}
-  cum_object_ori_error: {min_steps: 1000}
-  cum_lost_contact_steps: {min_steps: 1000}
+  cum_body_pos_error: {body_names: Torso, min_steps: 25}
+  cum_body_ori_error: {body_names: Torso, min_steps: 25}
+  cum_body_pos_error_local: {body_names: ".*", min_steps: 25}
+  cum_body_ori_error_local: {body_names: ".*", min_steps: 25}
+  cum_object_pos_error: {min_steps: 25}
+  cum_object_ori_error: {min_steps: 25}
+  cum_lost_contact_steps: {min_steps: 25}

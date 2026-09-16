@@ -55,11 +55,11 @@ class SimpleEnv(_Env):
             from active_adaptation.envs.terrain import TERRAINS
             
             env_spacing = self.cfg.viewer.get("env_spacing", 2.0)
-            # ARCTIC jobs launched by the project runner are homogeneous per
-            # process (s01 and s04 run sequentially or on separate GPUs).
-            # Physics replication avoids the aggregate-pair overflow observed
-            # with the heterogeneous-clone path at large environment counts.
-            scene_cfg = InteractiveSceneCfg(num_envs=self.cfg.num_envs, env_spacing=env_spacing, replicate_physics=True)
+            scene_cfg = InteractiveSceneCfg(
+                num_envs=self.cfg.num_envs,
+                env_spacing=env_spacing,
+                replicate_physics=bool(self.cfg.sim.replicate_physics),
+            )
             scene_cfg.sky_light = AssetBaseCfg(
                 prim_path="/World/skyLight",
                 spawn=sim_utils.DomeLightCfg(
@@ -266,9 +266,18 @@ class SimpleEnv(_Env):
             # At 8192 environments, PhysX requests roughly 100.7M ordinary
             # broadphase pairs, 151.0M aggregate found/lost pairs, and 67.1M
             # total aggregate pairs. Keep distinct buffers above those peaks.
-            sim_cfg.physx.gpu_found_lost_pairs_capacity = 120000000
-            sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 180000000
-            sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 80000000
+            # A one-env diagnostic does not need those multi-GiB allocations;
+            # its explicitly opt-in small buffers make physics smoke tests
+            # practical without changing any training configuration.
+            if os.environ.get("ARTHOI4D_HDMI_SMOKE_PHYSX_CAPACITIES", "") == "1":
+                sim_cfg.physx.gpu_found_lost_pairs_capacity = 2000000
+                sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 4000000
+                sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 2000000
+                print("[PHYSX_SMOKE] using reduced one-env pair capacities", flush=True)
+            else:
+                sim_cfg.physx.gpu_found_lost_pairs_capacity = 120000000
+                sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 180000000
+                sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 80000000
             sim_cfg.physx.enable_stabilization = False
             # sim_cfg.physx.gpu_collision_stack_size = 2**25
             # sim_cfg.physx.gpu_heap_capacity = 2**24

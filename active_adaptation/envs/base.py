@@ -2,6 +2,9 @@ import torch
 import numpy as np
 import hydra
 import inspect
+import os
+import json
+from pathlib import Path
 import re
 
 from tensordict.tensordict import TensorDictBase, TensorDict
@@ -100,11 +103,45 @@ class ObsGroup:
         #     self._exported = True
         # update only if outdated
         tensors = []
+        raw_trace_iteration = os.environ.get("ARTHOI4D_HDMI_RAW_OBS_TRACE_ITER")
+        trace_terms = (
+            self.name == "priv"
+            and raw_trace_iteration is not None
+            and int(raw_trace_iteration) == int(
+                getattr(next(iter(self.funcs.values())).env, "current_iter", -1)
+            )
+        )
+        raw_trace = {}
+        offset = 0
         # print(f"Computing observation group: {self.name}")
         for obs_key, func in self.funcs.items():
             tensor = func()
             tensors.append(tensor)
+            if trace_terms:
+                finite = torch.isfinite(tensor)
+                finite_count = int(finite.sum().item())
+                raw_trace[obs_key] = {
+                    "offset": offset,
+                    "numel": int(tensor.numel()),
+                    "width": int(tensor.shape[-1]),
+                    "finite": finite_count,
+                    "nonfinite": int(tensor.numel()) - finite_count,
+                    "max_abs": float(torch.nan_to_num(tensor).abs().max().item()),
+                }
+            offset += tensor.shape[-1]
             # print(f"\t{obs_key}: {tensor.shape}")
+        if trace_terms:
+            trace_path = os.environ.get("ARTHOI4D_HDMI_RAW_OBS_TRACE_PATH")
+            if trace_path:
+                source_env = next(iter(self.funcs.values())).env
+                record = {
+                    "iteration": int(source_env.current_iter),
+                    "timestamp": int(source_env.timestamp),
+                    "group": self.name,
+                    "terms": raw_trace,
+                }
+                with open(trace_path, "a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, sort_keys=True) + "\n")
         return torch.cat(tensors, dim=-1)
     
     def symmetry_transforms(self):
@@ -330,9 +367,179 @@ class _Env(EnvBase):
         self.termination_time = 0.
         self.observation_time = 0.
         self.ema_cnt = 0.
+
+        # Opt-in numerical forensics.  Normal training never enters this path.
+        # Keep a short on-device history for every environment and write only
+        # the causal window for the first non-finite value to disk.
+        trace_dir = os.environ.get("ARTHOI4D_HDMI_FINITE_TRACE_DIR")
+        self._finite_trace_dir = Path(trace_dir) if trace_dir else None
+        self._finite_trace_history = max(
+            1, int(os.environ.get("ARTHOI4D_HDMI_FINITE_TRACE_HISTORY", "4"))
+        )
+        self._finite_trace_events = 0
+        self._finite_trace_max_events = max(
+            1, int(os.environ.get("ARTHOI4D_HDMI_FINITE_TRACE_MAX_EVENTS", "1"))
+        )
+        # A physics solver can produce enormous finite values for one or more
+        # steps before overflow.  Let the standalone collision smoke test dump
+        # that causal window instead of waiting for an eventual NaN.
+        threshold_value = os.environ.get("ARTHOI4D_HDMI_FINITE_TRACE_ABS_THRESHOLD")
+        self._finite_trace_abs_threshold = (
+            None if threshold_value is None else float(threshold_value)
+        )
+        if (
+            self._finite_trace_abs_threshold is not None
+            and self._finite_trace_abs_threshold <= 0.0
+        ):
+            raise ValueError("ARTHOI4D_HDMI_FINITE_TRACE_ABS_THRESHOLD must be positive")
+        self._finite_trace_ring = []
+        if self._finite_trace_dir is not None:
+            self._finite_trace_dir.mkdir(parents=True, exist_ok=True)
+            print(f"Finite trace enabled: {self._finite_trace_dir}")
         
     def set_progress(self, progress: int):
         self.current_iter = progress
+
+    def _finite_trace_state(self, env_ids=None):
+        """Snapshot the live articulated state needed to diagnose a bad step."""
+        if self._finite_trace_dir is None:
+            return {}
+        if env_ids is None:
+            env_ids = slice(None)
+        result = {}
+        for name, asset in self.scene.articulations.items():
+            data = asset.data
+            values = {}
+            for key in ("root_state_w", "joint_pos", "joint_vel", "body_state_w"):
+                value = getattr(data, key, None)
+                if value is not None:
+                    values[key] = value[env_ids].clone()
+            result[name] = values
+        return result
+
+    @staticmethod
+    def _finite_trace_bad_ids(values):
+        bad = None
+        for asset_values in values.values():
+            for value in asset_values.values():
+                finite = torch.isfinite(value).reshape(value.shape[0], -1).all(dim=1)
+                current = ~finite
+                bad = current if bad is None else (bad | current)
+        return bad
+
+    def _finite_trace_append(self, stage, payload=None):
+        if self._finite_trace_dir is None:
+            return
+        state = self._finite_trace_state()
+        if os.environ.get("ARTHOI4D_HDMI_FINITE_TRACE_ALWAYS", "") == "1":
+            # Keep a cheap scalar timeline for every callback/substep.  The
+            # existing ring buffer remains reserved for causal tensor dumps
+            # when a non-finite or threshold event occurs.
+            scalar = {
+                "stage": stage,
+                "iteration": int(self.current_iter),
+                "timestamp": int(self.timestamp),
+                "episode_length": self.episode_length_buf.detach().cpu().tolist(),
+                "assets": {},
+            }
+            for asset_name, asset_values in state.items():
+                scalar["assets"][asset_name] = {}
+                for key, value in asset_values.items():
+                    finite = torch.isfinite(value).reshape(value.shape[0], -1).all(dim=1)
+                    scalar["assets"][asset_name][key] = {
+                        "finite": finite.detach().cpu().tolist(),
+                        "max_abs": torch.nan_to_num(value).abs().reshape(value.shape[0], -1).amax(dim=1).detach().cpu().tolist(),
+                    }
+            sensors = getattr(self.scene, "sensors", {})
+            if sensors:
+                scalar["sensors"] = {}
+                for sensor_name, sensor in sensors.items():
+                    force = getattr(getattr(sensor, "data", None), "net_forces_w", None)
+                    if force is not None:
+                        scalar["sensors"][sensor_name] = {
+                            "finite": torch.isfinite(force).reshape(force.shape[0], -1).all(dim=1).detach().cpu().tolist(),
+                            "max_abs": torch.nan_to_num(force).abs().reshape(force.shape[0], -1).amax(dim=1).detach().cpu().tolist(),
+                        }
+            if payload:
+                scalar["payload"] = {
+                    key: {
+                        "finite": torch.isfinite(value).reshape(value.shape[0], -1).all(dim=1).detach().cpu().tolist(),
+                        "max_abs": torch.nan_to_num(value).abs().reshape(value.shape[0], -1).amax(dim=1).detach().cpu().tolist(),
+                    }
+                    for key, value in payload.items()
+                    if value.is_floating_point()
+                }
+                pos_target = payload.get("pos_target")
+                robot_joint_pos = state.get("robot", {}).get("joint_pos")
+                if pos_target is not None and robot_joint_pos is not None:
+                    scalar["payload"]["pos_target_minus_joint_pos_max_abs"] = (
+                        (pos_target - robot_joint_pos).abs().amax(dim=1).detach().cpu().tolist()
+                    )
+            with (self._finite_trace_dir / "scalar_trace.jsonl").open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(scalar) + "\n")
+        entry = {
+            "stage": stage,
+            "iteration": self.current_iter,
+            "timestamp": self.timestamp,
+            "episode_length": self.episode_length_buf.clone(),
+            "state": state,
+        }
+        if payload:
+            entry.update({key: value.clone() for key, value in payload.items()})
+        self._finite_trace_ring.append(entry)
+        if len(self._finite_trace_ring) > self._finite_trace_history:
+            self._finite_trace_ring.pop(0)
+        bad = self._finite_trace_bad_ids(state)
+        if self._finite_trace_abs_threshold is not None:
+            threshold_bad = None
+            for asset_values in state.values():
+                for value in asset_values.values():
+                    current = (
+                        value.abs().reshape(value.shape[0], -1).amax(dim=1)
+                        > self._finite_trace_abs_threshold
+                    )
+                    threshold_bad = current if threshold_bad is None else (threshold_bad | current)
+            bad = threshold_bad if bad is None else (bad | threshold_bad)
+        for value in (payload or {}).values():
+            if value.is_floating_point():
+                current = ~torch.isfinite(value).reshape(value.shape[0], -1).all(dim=1)
+                bad = current if bad is None else (bad | current)
+        if bad is not None and bad.any():
+            self._finite_trace_flush(stage, bad.nonzero().squeeze(-1))
+
+    def _finite_trace_flush(self, stage, env_ids):
+        if self._finite_trace_events >= self._finite_trace_max_events:
+            return
+        self._finite_trace_events += 1
+        env_ids = env_ids.detach().cpu()
+        records = []
+        for entry in self._finite_trace_ring:
+            record = {"stage": entry["stage"], "iteration": entry["iteration"],
+                      "timestamp": entry["timestamp"], "env_ids": env_ids,
+                      "episode_length": entry["episode_length"][env_ids.to(self.device)].cpu()}
+            record["state"] = {
+                asset: {key: value[env_ids.to(value.device)].cpu() for key, value in values.items()}
+                for asset, values in entry["state"].items()
+            }
+            for key, value in entry.items():
+                if key not in {"stage", "iteration", "timestamp", "episode_length", "state"}:
+                    record[key] = value[env_ids.to(value.device)].cpu()
+            records.append(record)
+        path = self._finite_trace_dir / f"first_nonfinite_{self._finite_trace_events:02d}_{stage}.pt"
+        torch.save({"trigger_stage": stage, "trigger_env_ids": env_ids, "records": records}, path)
+        print(f"[FINITE_TRACE] wrote {path} for env ids {env_ids.tolist()}", flush=True)
+
+    def trace_policy_action(self, action):
+        """Called by the trainer immediately after policy inference."""
+        if self._finite_trace_dir is not None:
+            self._finite_trace_append("policy_action", {"policy_action": action})
+
+    def trace_action_target(self, raw_action, applied_action, pos_target):
+        if self._finite_trace_dir is not None:
+            self._finite_trace_append(
+                "action_target",
+                {"raw_action": raw_action, "applied_action": applied_action, "pos_target": pos_target},
+            )
 
     @property
     def action_dim(self) -> int:
@@ -372,6 +579,10 @@ class _Env(EnvBase):
     
     def _reset(self, tensordict: TensorDictBase | None = None, **kwargs) -> TensorDictBase:
         start = time.perf_counter()
+        trace_reset_stages = (
+            self._finite_trace_dir is not None
+            and os.environ.get("ARTHOI4D_HDMI_TRACE_RESET_STAGES", "") == "1"
+        )
         if tensordict is not None:
             env_mask = tensordict.get("_reset").reshape(self.num_envs)
             env_ids = env_mask.nonzero().squeeze(-1)
@@ -379,13 +590,27 @@ class _Env(EnvBase):
         else:
             env_ids = torch.arange(self.num_envs, device=self.device)
         if len(env_ids):
+            if self._finite_trace_dir is not None:
+                reset_mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+                reset_mask[env_ids] = True
+                self._finite_trace_append("reset_pre", {"reset_mask": reset_mask})
+            if trace_reset_stages:
+                print("[FINITE_TRACE] reset: _reset_idx", flush=True)
             self._reset_idx(env_ids)
+            if trace_reset_stages:
+                print("[FINITE_TRACE] reset: scene.reset", flush=True)
             self.scene.reset(env_ids)
         self.episode_length_buf[env_ids] = 0
         for callback in self._reset_callbacks:
             callback(env_ids)
+        if trace_reset_stages:
+            print("[FINITE_TRACE] reset: callbacks complete", flush=True)
+        if len(env_ids) and self._finite_trace_dir is not None:
+            self._finite_trace_append("reset_post", {"reset_mask": reset_mask})
         tensordict = TensorDict({}, self.num_envs, device=self.device)
         tensordict.update(self.observation_spec.zero())
+        if trace_reset_stages:
+            print("[FINITE_TRACE] reset: observation spec complete", flush=True)
         end = time.perf_counter()
         self.reset_time = self.reset_time * self._stats_ema_decay + (end - start)
         return tensordict
@@ -483,6 +708,8 @@ class _Env(EnvBase):
             self.scene.write_data_to_sim()
             self.sim.step(render=False)
             self.scene.update(self.physics_dt)
+            if self._finite_trace_dir is not None:
+                self._finite_trace_append(f"sim_substep_{substep}")
             for callback in self._post_step_callbacks:
                 callback(substep)
         end = time.perf_counter()

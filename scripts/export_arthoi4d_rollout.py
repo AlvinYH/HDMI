@@ -287,6 +287,7 @@ def main(cfg: DictConfig) -> None:
         )
         if max_steps <= 0:
             raise ValueError("rollout_steps must be positive")
+        fixed_horizon = bool(cfg.get("fixed_horizon", False))
         policy_eval = policy.get_rollout_policy("eval")
         env.base_env.eval()
         env.eval()
@@ -300,7 +301,10 @@ def main(cfg: DictConfig) -> None:
                 action_tensordict = policy_eval(tensordict)
                 transition = env.step(action_tensordict)
                 frames.append(_snapshot(command, bundle, human_body_ids, human_joint_ids))
-                if bool(transition["next", "done"][0].item()):
+                if (
+                    not fixed_horizon
+                    and bool(transition["next", "done"][0].item())
+                ):
                     break
                 tensordict = transition["next"]
 

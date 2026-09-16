@@ -7,7 +7,9 @@ import functools
 import torch.utils._pytree as pytree
 import einops
 import copy
+import json
 import numpy as np
+import os
 
 from torchrl.data import CompositeSpec, TensorSpec, Unbounded
 from torchrl.modules import ProbabilisticActor
@@ -179,6 +181,16 @@ class PPOROA(TensorDictModuleBase):
 
         self.action_dim = action_spec.shape[-1]
         self.joint_names = env.action_manager.joint_names
+        # This is deliberately an environment-variable opt-in so production
+        # training keeps the upstream HDMI execution path unchanged.
+        self._ppo_trace_path = os.environ.get("ARTHOI4D_HDMI_PPO_TRACE_PATH")
+        self._ppo_trace_fail_fast = os.environ.get(
+            "ARTHOI4D_HDMI_PPO_TRACE_FAIL_FAST", "0"
+        ).lower() in {"1", "true", "yes"}
+        self._ppo_trace_context = {"iteration": None, "epoch": None, "minibatch": None}
+        if self._ppo_trace_path:
+            os.makedirs(os.path.dirname(self._ppo_trace_path) or ".", exist_ok=True)
+            self._trace_ppo("trace_started", pid=os.getpid())
         
         fake_input = observation_spec.zero()
         
@@ -467,6 +479,12 @@ class PPOROA(TensorDictModuleBase):
     def train_policy(self, tensordict: TensorDict):    
         infos = []
         self._compute_advantage(tensordict, self.critic, "adv", "ret", update_value_norm=True)
+        if self._ppo_trace_path:
+            self._trace_ppo(
+                "advantage_ready",
+                rollout=self._rollout_summary(tensordict),
+                value_norm=self._state_summary(self.value_norm.state_dict()),
+            )
 
         # entropy coef schedule
         current_iter = self.env.current_iter
@@ -475,7 +493,12 @@ class PPOROA(TensorDictModuleBase):
 
         for epoch in range(self.cfg.ppo_epochs):
             batch = make_batch(tensordict, self.cfg.num_minibatches)
-            for minibatch in batch:
+            for minibatch_index, minibatch in enumerate(batch):
+                self._ppo_trace_context.update(
+                    iteration=int(self.env.current_iter),
+                    epoch=epoch,
+                    minibatch=minibatch_index,
+                )
                 info = {}
                 info.update(self._update_ppo(minibatch))
                 infos.append(info)
@@ -663,6 +686,14 @@ class PPOROA(TensorDictModuleBase):
         else:
             raise ValueError(f"Invalid phase: {self.cfg.phase}")
 
+        if self._ppo_trace_path:
+            self._trace_ppo(
+                "minibatch_pre_forward",
+                minibatch=self._rollout_summary(tensordict),
+                parameters=self._parameter_summary(actor, self.critic, self.encoder_priv),
+                optimizers=self._optimizer_summary(),
+            )
+
         dist: D.Independent = actor.get_dist(tensordict)
         log_probs = dist.log_prob(tensordict[ACTION_KEY])
         entropy = dist.entropy().mean()
@@ -692,6 +723,21 @@ class PPOROA(TensorDictModuleBase):
 
         loss = policy_loss + entropy_loss + value_loss.mean()
 
+        if self._ppo_trace_path:
+            forward_summary = {
+                "loc": self._tensor_summary(dist.loc),
+                "scale": self._tensor_summary(dist.scale),
+                "log_probs": self._tensor_summary(log_probs),
+                "entropy": self._tensor_summary(entropy),
+                "log_ratio": self._tensor_summary(log_ratio),
+                "ratio": self._tensor_summary(ratio),
+                "policy_loss": self._tensor_summary(policy_loss),
+                "value_loss": self._tensor_summary(value_loss),
+                "loss": self._tensor_summary(loss),
+            }
+            self._trace_ppo("minibatch_forward", tensors=forward_summary)
+            self._raise_if_traced_nonfinite("forward", forward_summary)
+
         self.opt_policy.zero_grad()
         self.opt_critic.zero_grad()
         loss.backward()
@@ -701,8 +747,32 @@ class PPOROA(TensorDictModuleBase):
             priv_grad_norm = nn.utils.clip_grad_norm_(self.encoder_priv.parameters(), self.cfg.max_grad_norm)
         else:
             priv_grad_norm = torch.zeros(1)
+        if self._ppo_trace_path:
+            gradient_summary = self._parameter_summary(
+                actor, self.critic, self.encoder_priv, gradients=True
+            )
+            self._trace_ppo(
+                "minibatch_post_backward",
+                gradients=gradient_summary,
+                actor_grad_norm=self._tensor_summary(actor_grad_norm),
+                critic_grad_norm=self._tensor_summary(critic_grad_norm),
+                priv_grad_norm=self._tensor_summary(priv_grad_norm),
+            )
+            self._raise_if_traced_nonfinite("backward", gradient_summary)
         self.opt_policy.step()
         self.opt_critic.step()
+        if self._ppo_trace_path:
+            post_step_summary = self._parameter_summary(actor, self.critic, self.encoder_priv)
+            optimizer_summary = self._optimizer_summary()
+            self._trace_ppo(
+                "minibatch_post_step",
+                parameters=post_step_summary,
+                optimizers=optimizer_summary,
+            )
+            self._raise_if_traced_nonfinite("optimizer_step", {
+                "parameters": post_step_summary,
+                "optimizers": optimizer_summary,
+            })
         
         with torch.no_grad():
             explained_var = 1 - value_loss / b_returns[valid].var(dim=0)
@@ -732,6 +802,161 @@ class PPOROA(TensorDictModuleBase):
             info[f"critic/{group_name}.explained_var"] = explained_var[i]
             info[f"critic/{group_name}.value_loss"] = value_loss[i].detach()
         return info
+
+    def trace_rollout(self, stage: str, tensordict: TensorDict, vecnorm=None):
+        """Record rollout/VecNorm finiteness without retaining training tensors."""
+        if not self._ppo_trace_path:
+            return
+        state = vecnorm.state_dict() if vecnorm is not None else None
+        summary = {
+            "rollout": self._rollout_summary(tensordict),
+            "vecnorm": self._state_summary(state),
+        }
+        self._trace_ppo(f"rollout_{stage}", **summary)
+        self._raise_if_traced_nonfinite(f"rollout_{stage}", summary)
+
+    def set_trace_rollout_context(self, iteration: int, step: int):
+        """Set outer-rollout context before policy inference begins."""
+        if self._ppo_trace_path:
+            self._ppo_trace_context.update(
+                iteration=iteration,
+                epoch=None,
+                minibatch=None,
+                rollout_step=step,
+            )
+
+    def trace_policy_io(self, stage: str, tensordict: TensorDict):
+        """Summarize the normalized carry and actor distribution around inference."""
+        if not self._ppo_trace_path:
+            return
+        keys = (
+            "command", "policy", "object", "priv", "is_init", "adapt_hx",
+            PRIV_FEATURE_KEY, PRIV_PRED_KEY, "loc", "scale", ACTION_KEY,
+            "sample_log_prob", ("next", "adapt_hx"),
+        )
+        summary = {}
+        for key in keys:
+            value = tensordict.get(key, None)
+            if value is not None:
+                label = "/".join(key) if isinstance(key, tuple) else key
+                summary[label] = self._tensor_summary(value)
+        self._trace_ppo(f"policy_{stage}", tensors=summary)
+        self._raise_if_traced_nonfinite(f"policy_{stage}", summary)
+
+    @staticmethod
+    def _tensor_summary(value):
+        if not isinstance(value, torch.Tensor):
+            return {"type": type(value).__name__}
+        with torch.no_grad():
+            finite = torch.isfinite(value)
+            finite_count = int(finite.sum().item())
+            numel = int(value.numel())
+            result = {
+                "shape": list(value.shape),
+                "numel": numel,
+                "finite": finite_count,
+                "nonfinite": numel - finite_count,
+            }
+            if finite_count:
+                result["max_abs"] = float(value[finite].abs().max().item())
+            else:
+                result["max_abs"] = None
+            return result
+
+    def _rollout_summary(self, tensordict: TensorDict):
+        keys = (
+            "command", "policy", "object", "priv", ACTION_KEY,
+            "sample_log_prob", "adv", "adv_before_norm", "ret", "state_value",
+            ("next", "state_value"), ("next", "reward"), ("next", "discount"),
+        )
+        result = {}
+        for key in keys:
+            value = tensordict.get(key, None)
+            if value is not None:
+                label = "/".join(key) if isinstance(key, tuple) else key
+                result[label] = self._tensor_summary(value)
+        return result
+
+    def _parameter_summary(self, actor, critic, encoder_priv, gradients=False):
+        modules = {"actor": actor, "critic": critic, "encoder_priv": encoder_priv}
+        result = {}
+        for name, module in modules.items():
+            tensors = [param.grad if gradients else param for param in module.parameters()]
+            tensors = [tensor for tensor in tensors if tensor is not None]
+            if not tensors:
+                result[name] = {"numel": 0, "finite": 0, "nonfinite": 0, "max_abs": None}
+                continue
+            summaries = [self._tensor_summary(tensor) for tensor in tensors]
+            finite_count = sum(summary["finite"] for summary in summaries)
+            result[name] = {
+                "numel": sum(summary["numel"] for summary in summaries),
+                "finite": finite_count,
+                "nonfinite": sum(summary["nonfinite"] for summary in summaries),
+                "max_abs": max(
+                    (summary["max_abs"] for summary in summaries if summary["max_abs"] is not None),
+                    default=None,
+                ),
+            }
+        return result
+
+    def _optimizer_summary(self):
+        result = {}
+        for name, optimizer in (("policy", self.opt_policy), ("critic", self.opt_critic)):
+            tensors = [
+                value for state in optimizer.state.values() for value in state.values()
+                if isinstance(value, torch.Tensor)
+            ]
+            summaries = [self._tensor_summary(tensor) for tensor in tensors]
+            finite_count = sum(summary["finite"] for summary in summaries)
+            result[name] = {
+                "numel": sum(summary["numel"] for summary in summaries),
+                "finite": finite_count,
+                "nonfinite": sum(summary["nonfinite"] for summary in summaries),
+                "max_abs": max(
+                    (summary["max_abs"] for summary in summaries if summary["max_abs"] is not None),
+                    default=None,
+                ),
+            }
+        return result
+
+    def _state_summary(self, state):
+        if state is None:
+            return {}
+        result = {}
+        def visit(prefix, value):
+            if isinstance(value, torch.Tensor):
+                result[prefix] = self._tensor_summary(value)
+            elif isinstance(value, dict):
+                for key, child in value.items():
+                    visit(f"{prefix}/{key}" if prefix else str(key), child)
+        visit("", state)
+        return result
+
+    def _trace_ppo(self, event: str, **payload):
+        if not self._ppo_trace_path:
+            return
+        record = {"event": event, **self._ppo_trace_context, **payload}
+        with open(self._ppo_trace_path, "a", encoding="utf-8") as trace_file:
+            trace_file.write(json.dumps(record, allow_nan=True, sort_keys=True) + "\n")
+            trace_file.flush()
+
+    @staticmethod
+    def _contains_nonfinite(value):
+        if isinstance(value, dict):
+            if value.get("nonfinite", 0):
+                return True
+            return any(PPOROA._contains_nonfinite(child) for child in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(PPOROA._contains_nonfinite(child) for child in value)
+        return False
+
+    def _raise_if_traced_nonfinite(self, stage: str, summary):
+        if self._ppo_trace_fail_fast and self._contains_nonfinite(summary):
+            self._trace_ppo("nonfinite_fail_fast", stage=stage)
+            raise FloatingPointError(
+                f"Non-finite value recorded during PPO {stage}; "
+                f"see {self._ppo_trace_path}"
+            )
 
     def state_dict(self):
         if self.cfg.phase == "train":

@@ -11,6 +11,7 @@ import datetime
 
 from omegaconf import OmegaConf, DictConfig
 from collections import OrderedDict
+from collections.abc import Mapping
 from tqdm import tqdm
 from setproctitle import setproctitle
 
@@ -102,6 +103,44 @@ def main(cfg: DictConfig):
     log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
     logging.info(f"Log interval: {log_interval} steps")
 
+    def _nonfinite_state_entries(value, prefix):
+        """Return tensor paths containing NaN/Inf for low-frequency checkpoints."""
+        entries = []
+        if isinstance(value, torch.Tensor):
+            if value.numel() and not bool(torch.isfinite(value).all().item()):
+                nonfinite = int((~torch.isfinite(value)).sum().item())
+                entries.append((prefix, nonfinite, list(value.shape), str(value.dtype)))
+        elif isinstance(value, Mapping):
+            for key, child in value.items():
+                child_prefix = f"{prefix}/{key}" if prefix else str(key)
+                entries.extend(_nonfinite_state_entries(child, child_prefix))
+        elif isinstance(value, (list, tuple)):
+            for index, child in enumerate(value):
+                entries.extend(_nonfinite_state_entries(child, f"{prefix}[{index}]"))
+        return entries
+
+    def _check_checkpoint_finite(state_dict, checkpoint_name):
+        """Check saved model/runtime state only when a checkpoint is emitted."""
+        entries = []
+        for key in ("policy", "env", "vecnorm"):
+            if key in state_dict:
+                entries.extend(_nonfinite_state_entries(state_dict[key], key))
+        if entries:
+            details = "; ".join(
+                f"{path}: nonfinite={count}, shape={shape}, dtype={dtype}"
+                for path, count, shape, dtype in entries[:20]
+            )
+            logging.error(
+                "Non-finite checkpoint state at %s (%d tensor paths): %s",
+                checkpoint_name,
+                len(entries),
+                details,
+            )
+            raise FloatingPointError(
+                f"Non-finite checkpoint state at {checkpoint_name}; see log for paths"
+            )
+        logging.info("Checkpoint finite check passed: %s", checkpoint_name)
+
     stats_keys = [
         k for k in env.reward_spec.keys(True, True) 
         if isinstance(k, tuple) and k[0] == "stats"
@@ -117,6 +156,7 @@ def main(cfg: DictConfig):
         state_dict["cfg"] = cfg
         if "vecnorm" in locals():
             state_dict["vecnorm"] = vecnorm.state_dict()
+        _check_checkpoint_finite(state_dict, checkpoint_name)
         torch.save(state_dict, ckpt_path)
         if artifact:
             artifact = wandb.Artifact(
@@ -161,13 +201,24 @@ def main(cfg: DictConfig):
 
     env_frames = 0
     start_iter = env.current_iter
+    trace_rollout_iteration = os.environ.get("ARTHOI4D_HDMI_PPO_TRACE_ROLLOUT_ITER")
+    if trace_rollout_iteration is not None:
+        trace_rollout_iteration = int(trace_rollout_iteration)
     for i in progress:
         rollout_start = time.perf_counter()
         with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
             torch.compiler.cudagraph_mark_step_begin() # for compiled policy
             env.set_progress(start_iter + i)
             for step in range(cfg.algo.train_every):
+                policy.set_trace_rollout_context(start_iter + i, step)
+                trace_policy_io = step == 0 or (start_iter + i) == trace_rollout_iteration
+                if trace_policy_io:
+                    policy.trace_policy_io("pre", carry)
                 carry = rollout_policy(carry)
+                if trace_policy_io:
+                    policy.trace_policy_io("post", carry)
+                # Opt-in no-op unless ARTHOI4D_HDMI_FINITE_TRACE_DIR is set.
+                env.base_env.trace_policy_action(carry["action"])
                 td, carry = env.step_and_maybe_reset(carry)
                 td["next"] = td["next"].select("done", "terminated", "discount", "reward", "stats", "is_init", "adapt_hx", strict=False)
                 data_buf[:, step] = td
@@ -189,7 +240,9 @@ def main(cfg: DictConfig):
                 key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
                 info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
+        policy.trace_rollout("pre_train", data_buf, vecnorm)
         info.update(policy.train_op(data_buf))
+        policy.trace_rollout("post_train", data_buf, vecnorm)
         training_time = time.perf_counter() - training_start
         info.update(env.extra)
         info.update(env.stats_ema)
