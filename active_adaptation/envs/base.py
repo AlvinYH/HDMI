@@ -311,14 +311,21 @@ class _Env(EnvBase):
                 reward: mdp.Reward = rew_cls(env=self, **params)
                 funcs[rew_name] = reward
                 reward_spec["stats", group_name, rew_name] = UnboundedContinuous(1, device=self.device)
-                self._update_callbacks.append(reward.update)
-                self._reset_callbacks.append(reward.reset)
-                self._debug_draw_callbacks.append(reward.debug_draw)
-                self._pre_step_callbacks.append(reward.step)
-                self._post_step_callbacks.append(reward.post_step)
                 print(f"\t{rew_name}: \t{reward.weight:.2f}, \t{reward.enabled}")
-                self._stats_ema[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
-                self._perf_ema_reward[group_name][rew_name] = (torch.tensor(0., device=self.device), torch.tensor(0., device=self.device))
+                if reward.enabled:
+                    self._update_callbacks.append(reward.update)
+                    self._reset_callbacks.append(reward.reset)
+                    self._debug_draw_callbacks.append(reward.debug_draw)
+                    self._pre_step_callbacks.append(reward.step)
+                    self._post_step_callbacks.append(reward.post_step)
+                    self._stats_ema[group_name][rew_name] = (
+                        torch.tensor(0., device=self.device),
+                        torch.tensor(0., device=self.device),
+                    )
+                    self._perf_ema_reward[group_name][rew_name] = (
+                        torch.tensor(0., device=self.device),
+                        torch.tensor(0., device=self.device),
+                    )
             
             self.reward_groups[group_name] = RewardGroup(self, group_name, funcs, multiplicative=multiplicative)
             reward_spec["stats", group_name, "return"] = UnboundedContinuous(1, device=self.device)
@@ -850,6 +857,8 @@ class RewardGroup:
         rewards = []
         # try:
         for key, func in self.funcs.items():
+            if not func.enabled:
+                continue
             time_start = time.perf_counter()
             reward, count = func()
             time_end = time.perf_counter()
@@ -863,8 +872,7 @@ class RewardGroup:
             sum_perf, cnt_perf = self.env._perf_ema_reward[self.name][key]
             sum_perf.mul_(self.env._stats_ema_decay).add_(time_end - time_start)
             cnt_perf.mul_(self.env._stats_ema_decay).add_(1.0)
-            if func.enabled:
-                rewards.append(reward)
+            rewards.append(reward)
         # except Exception as e:
         #     raise RuntimeError(f"Error in computing reward for {key}: {e}")
         if len(rewards):

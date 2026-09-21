@@ -117,6 +117,15 @@ class SimpleEnv(_Env):
                     raise ValueError("ArtHOI4D requires at least one contact-region link")
                 if len(set(contact_region_link_names)) != len(contact_region_link_names):
                     raise ValueError("ArtHOI4D contact-region links must be unique")
+                contact_region_telemetry = (
+                    os.environ.get("ARTHOI4D_HDMI_CONTACT_REGION_TELEMETRY", "1")
+                    == "1"
+                )
+                if not contact_region_telemetry:
+                    print(
+                        "[ARTHOI4D] contact-region telemetry disabled for training",
+                        flush=True,
+                    )
                 robot_body_paths = ROBOT_BODY_PRIM_PATHS.get(self.cfg.robot.name, {})
                 object_body_paths = OBJECT_BODY_PRIM_PATHS.get(obj_name, {})
 
@@ -141,7 +150,9 @@ class SimpleEnv(_Env):
                     # then reports forces from this hand to exactly that link,
                     # rather than inferring benchmark contact from the native
                     # reward target point.
-                    for region_link_name in contact_region_link_names:
+                    for region_link_name in (
+                        contact_region_link_names if contact_region_telemetry else ()
+                    ):
                         if region_link_name not in object_body_paths:
                             raise ValueError(
                                 "ArtHOI4D contact-region link is missing from the "
@@ -275,9 +286,9 @@ class SimpleEnv(_Env):
                 sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 2000000
                 print("[PHYSX_SMOKE] using reduced one-env pair capacities", flush=True)
             else:
-                sim_cfg.physx.gpu_found_lost_pairs_capacity = 120000000
-                sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 180000000
-                sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 80000000
+                sim_cfg.physx.gpu_found_lost_pairs_capacity = 65000000              # 120000000
+                sim_cfg.physx.gpu_found_lost_aggregate_pairs_capacity = 96000000    # 180000000
+                sim_cfg.physx.gpu_total_aggregate_pairs_capacity = 44000000         # 80000000
             sim_cfg.physx.enable_stabilization = False
             # sim_cfg.physx.gpu_collision_stack_size = 2**25
             # sim_cfg.physx.gpu_heap_capacity = 2**24

@@ -181,6 +181,7 @@ class PPOROA(TensorDictModuleBase):
 
         self.action_dim = action_spec.shape[-1]
         self.joint_names = env.action_manager.joint_names
+        self.log_detailed_metrics = True
         # This is deliberately an environment-variable opt-in so production
         # training keeps the upstream HDMI execution path unchanged.
         self._ppo_trace_path = os.environ.get("ARTHOI4D_HDMI_PPO_TRACE_PATH")
@@ -471,8 +472,9 @@ class PPOROA(TensorDictModuleBase):
 
         actor = self.actor if self.cfg.phase == "train" else self.actor_adapt
         action_std = actor.module[0][2].module.actor_std.detach()
-        for joint_name, std in zip(self.joint_names, action_std):
-            info[f"actor_std/{joint_name}"] = std
+        if self.log_detailed_metrics:
+            for joint_name, std in zip(self.joint_names, action_std):
+                info[f"actor_std/{joint_name}"] = std
         info["actor_std/mean"] = action_std.mean()
         return info
     

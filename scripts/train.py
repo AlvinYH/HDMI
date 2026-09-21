@@ -8,6 +8,7 @@ import logging
 import os
 import time
 import datetime
+import random
 
 from omegaconf import OmegaConf, DictConfig
 from collections import OrderedDict
@@ -36,6 +37,8 @@ CONFIG_PATH = os.path.join(FILE_PATH, "..", "cfg")
 @hydra.main(config_path=CONFIG_PATH, config_name="train", version_base=None)
 def main(cfg: DictConfig):
     OmegaConf.set_struct(cfg, False)
+    os.environ.setdefault("ARTHOI4D_HDMI_VALIDATE_RESET_LIMITS", "0")
+    os.environ.setdefault("ARTHOI4D_HDMI_CONTACT_REGION_TELEMETRY", "0")
 
     print(f"is_distributed: {aa.is_distributed()}, local_rank: {aa.get_local_rank()}/{aa.get_world_size()}")
     app_cfg = OmegaConf.to_container(cfg.app, resolve=True)
@@ -80,12 +83,27 @@ def main(cfg: DictConfig):
     # artifacts in Hydra's explicitly requested output directory instead.
     run_dir = os.getcwd()
     os.makedirs(run_dir, exist_ok=True)
+    heartbeat_path = os.environ.get("ARTHOI4D_HDMI_HEARTBEAT_PATH")
+
+    def heartbeat(stage, iteration=-1, step=-1):
+        if not heartbeat_path or not aa.is_main_process():
+            return
+        tmp_path = f"{heartbeat_path}.tmp.{os.getpid()}"
+        with open(tmp_path, "w", encoding="utf-8") as stream:
+            stream.write(
+                f"timestamp={time.time():.6f} iteration={iteration} "
+                f"step={step} stage={stage}\n"
+            )
+        os.replace(tmp_path, heartbeat_path)
+
+    heartbeat("initializing")
     cfg_save_path = os.path.join(run_dir, "cfg.yaml")
     OmegaConf.save(cfg, cfg_save_path)
     run.save(cfg_save_path, policy="now")
     run.save(os.path.join(run_dir, "config.yaml"), policy="now")
 
     env, policy, vecnorm = make_env_policy(cfg)
+    heartbeat("initialized")
 
     import inspect
     import shutil
@@ -100,7 +118,16 @@ def main(cfg: DictConfig):
     total_iters = total_frames // frames_per_batch
     save_interval = cfg.get("save_interval", -1)
 
-    log_interval = (env.max_episode_length // cfg.algo.train_every) + 1
+    configured_log_interval = cfg.get("train_stats_interval", 20)
+    if configured_log_interval is None:
+        configured_log_interval = 20
+    log_interval = max(
+        1,
+        int(os.environ.get(
+            "ARTHOI4D_HDMI_LOG_INTERVAL",
+            configured_log_interval,
+        )),
+    )
     logging.info(f"Log interval: {log_interval} steps")
 
     def _nonfinite_state_entries(value, prefix):
@@ -147,6 +174,21 @@ def main(cfg: DictConfig):
     ]
     episode_stats = EpisodeStats(stats_keys, device=env.device)
 
+    checkpoint_path = cfg.get("checkpoint_path")
+    resume_state = None
+    if checkpoint_path:
+        resume_state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        for name in ("opt_policy", "opt_critic", "opt_adapt", "opt_adapt_actor", "opt_estimator", "opt_dr_estimator"):
+            if name in resume_state.get("optimizers", {}) and hasattr(policy, name):
+                getattr(policy, name).load_state_dict(resume_state["optimizers"][name])
+        if "rng" in resume_state:
+            random.setstate(resume_state["rng"]["python"])
+            np.random.set_state(resume_state["rng"]["numpy"])
+            torch.set_rng_state(resume_state["rng"]["torch"])
+            torch.cuda.set_rng_state_all(resume_state["rng"]["cuda"])
+        else:
+            logging.warning("Legacy checkpoint has no optimizer/RNG state; resuming weights and iteration only")
+
     def save(policy, checkpoint_name: str, artifact: bool=False):
         ckpt_path = os.path.join(run_dir, f"{checkpoint_name}.pt")
         state_dict = OrderedDict()
@@ -154,10 +196,25 @@ def main(cfg: DictConfig):
         state_dict["policy"] = policy.state_dict()
         state_dict["env"] = env.state_dict()
         state_dict["cfg"] = cfg
-        if "vecnorm" in locals():
+        state_dict["optimizers"] = {
+            name: getattr(policy, name).state_dict()
+            for name in ("opt_policy", "opt_critic", "opt_adapt", "opt_adapt_actor", "opt_estimator", "opt_dr_estimator")
+            if hasattr(policy, name)
+        }
+        state_dict["rng"] = {
+            "python": random.getstate(), "numpy": np.random.get_state(),
+            "torch": torch.get_rng_state(), "cuda": torch.cuda.get_rng_state_all(),
+        }
+        if vecnorm is not None:
             state_dict["vecnorm"] = vecnorm.state_dict()
         _check_checkpoint_finite(state_dict, checkpoint_name)
-        torch.save(state_dict, ckpt_path)
+        tmp_path = ckpt_path + f".tmp.{os.getpid()}"
+        try:
+            torch.save(state_dict, tmp_path)
+            os.replace(tmp_path, ckpt_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         if artifact:
             artifact = wandb.Artifact(
                 f"{type(env).__name__}-{type(policy).__name__}",
@@ -194,24 +251,21 @@ def main(cfg: DictConfig):
         data_buf.set(key, buf)
     logging.info(f"Data buffer size: {data_buf.bytes() / 1e6:.2f} MB")
 
-    if aa.is_main_process():
-        progress = tqdm(range(total_iters))
-    else:
-        progress = range(total_iters)
-
-    env_frames = 0
-    start_iter = env.current_iter
+    start_iter = int(env.current_iter) + (1 if resume_state is not None else 0)
+    progress = tqdm(range(start_iter, total_iters)) if aa.is_main_process() else range(start_iter, total_iters)
+    env_frames = start_iter * frames_per_batch
     trace_rollout_iteration = os.environ.get("ARTHOI4D_HDMI_PPO_TRACE_ROLLOUT_ITER")
     if trace_rollout_iteration is not None:
         trace_rollout_iteration = int(trace_rollout_iteration)
     for i in progress:
+        heartbeat("rollout", i, 0)
         rollout_start = time.perf_counter()
         with torch.inference_mode(), set_exploration_type(ExplorationType.RANDOM):
             torch.compiler.cudagraph_mark_step_begin() # for compiled policy
-            env.set_progress(start_iter + i)
+            env.set_progress(i)
             for step in range(cfg.algo.train_every):
-                policy.set_trace_rollout_context(start_iter + i, step)
-                trace_policy_io = step == 0 or (start_iter + i) == trace_rollout_iteration
+                policy.set_trace_rollout_context(i, step)
+                trace_policy_io = step == 0 or i == trace_rollout_iteration
                 if trace_policy_io:
                     policy.trace_policy_io("pre", carry)
                 carry = rollout_policy(carry)
@@ -234,18 +288,23 @@ def main(cfg: DictConfig):
         episode_stats.add(data_buf)
         env_frames += data_buf.numel()
 
+        should_log = i % log_interval == 0 or i == total_iters - 1
+        if hasattr(policy, "log_detailed_metrics"):
+            policy.log_detailed_metrics = should_log
         info = {}
-        if i % log_interval == 0 and len(episode_stats):
+        if should_log and len(episode_stats):
             for k, v in sorted(episode_stats.pop().items(True, True)):
                 key = "train/" + ("/".join(k) if isinstance(k, tuple) else k)
                 info[key] = torch.mean(v.float()).item()
         training_start = time.perf_counter()
+        heartbeat("train_op", i)
         policy.trace_rollout("pre_train", data_buf, vecnorm)
         info.update(policy.train_op(data_buf))
         policy.trace_rollout("post_train", data_buf, vecnorm)
         training_time = time.perf_counter() - training_start
-        info.update(env.extra)
-        info.update(env.stats_ema)
+        if should_log:
+            info.update(env.extra)
+            info.update(env.stats_ema)
 
         if hasattr(policy, "step_schedule"):
             policy.step_schedule(i / total_iters)
@@ -254,10 +313,11 @@ def main(cfg: DictConfig):
         info["rollout_fps"] = data_buf.numel() / rollout_time
         info["training_time"] = training_time
 
-        if should_save(i):
+        if should_save(i) and not os.path.exists(os.path.join(run_dir, f"checkpoint_{i}.pt")):
+            heartbeat("checkpoint", i)
             save(policy, f"checkpoint_{i}")
 
-        if aa.is_main_process():
+        if aa.is_main_process() and should_log:
             # print(OmegaConf.to_yaml({k: v for k, v in info.items() if (isinstance(v, (float, int)) and not k.startswith("performance_reward"))}))
             run.log(info)
 

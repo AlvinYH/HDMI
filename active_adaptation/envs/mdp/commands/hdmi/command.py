@@ -163,6 +163,12 @@ class RobotTracking(Command):
         self.pose_range = torch.tensor(pose_range_list, device=self.device)
         velocity_range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         self.velocity_range = torch.tensor(velocity_range_list, device=self.device)
+        self.pose_randomization_enabled = any(
+            float(value) != 0.0 for pair in pose_range_list for value in pair
+        )
+        self.velocity_randomization_enabled = any(
+            float(value) != 0.0 for pair in velocity_range_list for value in pair
+        )
 
         self.init_joint_pos_noise = init_joint_pos_noise
         self.init_joint_vel_noise = init_joint_vel_noise
@@ -183,12 +189,16 @@ class RobotTracking(Command):
             self.pose_range.fill_(0.0)
             self.init_joint_pos_noise = 0.0
             self.init_joint_vel_noise = 0.0
+            self.pose_randomization_enabled = False
+            self.velocity_randomization_enabled = False
         
         if self.record_motion:
             assert self.num_envs == 1, "record_motion only supports num_envs=1"
             self.pose_range.fill_(0.0)
             self.init_joint_pos_noise = 0.0
             self.init_joint_vel_noise = 0.0
+            self.pose_randomization_enabled = False
+            self.velocity_randomization_enabled = False
 
         if call_update:
             self._init_debug_draw()
@@ -239,18 +249,30 @@ class RobotTracking(Command):
         init_root_ang_vel = motion.body_ang_vel_w[:, self.root_body_idx_motion]
 
         # poses
-        rand_samples = sample_uniform(self.pose_range[:, 0], self.pose_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
-            rand_samples.fill_(0.0)
-        positions = init_root_pos + self.env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
-        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-        orientations = quat_mul(init_root_quat, orientations_delta)
+        if self.pose_randomization_enabled and self.env.training:
+            rand_samples = sample_uniform(
+                self.pose_range[:, 0], self.pose_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
+            positions = (
+                init_root_pos + self.env.scene.env_origins[env_ids]
+                + rand_samples[:, 0:3]
+            )
+            orientations_delta = quat_from_euler_xyz(
+                rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+            )
+            orientations = quat_mul(init_root_quat, orientations_delta)
+        else:
+            positions = init_root_pos + self.env.scene.env_origins[env_ids]
+            orientations = init_root_quat
 
         # velocities
-        rand_samples = sample_uniform(self.velocity_range[:, 0], self.velocity_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
-            rand_samples.fill_(0.0)
-        velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1) + rand_samples
+        velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1)
+        if self.velocity_randomization_enabled and self.env.training:
+            velocities = velocities + sample_uniform(
+                self.velocity_range[:, 0], self.velocity_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
 
         self.asset.write_root_link_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
         self.asset.write_root_com_velocity_to_sim(velocities, env_ids=env_ids)
@@ -314,22 +336,16 @@ class RobotTracking(Command):
             joint_vel_limits,
         )
 
-        joint_pos_noise = sample_uniform(
-            -1,
-            1,
-            reference_joint_pos.shape,
-            device=self.device,
-        ) * self.init_joint_pos_noise
-
-        joint_vel_noise = sample_uniform(
-            -1,
-            1,
-            reference_joint_vel.shape,
-            device=self.device,
-        ) * self.init_joint_vel_noise
-
-        init_joint_pos = reference_joint_pos + joint_pos_noise
-        init_joint_vel = reference_joint_vel + joint_vel_noise
+        init_joint_pos = reference_joint_pos
+        init_joint_vel = reference_joint_vel
+        if self.init_joint_pos_noise != 0.0:
+            init_joint_pos = init_joint_pos + sample_uniform(
+                -1, 1, reference_joint_pos.shape, device=self.device
+            ) * self.init_joint_pos_noise
+        if self.init_joint_vel_noise != 0.0:
+            init_joint_vel = init_joint_vel + sample_uniform(
+                -1, 1, reference_joint_vel.shape, device=self.device
+            ) * self.init_joint_vel_noise
 
         # Noise may reach the hard boundary; the unmodified reference was checked above.
         init_joint_pos.clamp_(
@@ -560,11 +576,15 @@ class RobotObjectTracking(RobotTracking):
 
         pose_range_list = [object_pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         self.object_pose_range = torch.tensor(pose_range_list, device=self.device)
+        self.object_pose_randomization_enabled = any(
+            float(value) != 0.0 for pair in pose_range_list for value in pair
+        )
         self.object_init_joint_pos_noise = object_init_joint_pos_noise
         self.object_init_joint_vel_noise = object_init_joint_vel_noise
 
         if self.replay_motion or self.record_motion:
             self.object_pose_range.fill_(0.0)
+            self.object_pose_randomization_enabled = False
             self.object_init_joint_pos_noise = 0.0
             self.object_init_joint_vel_noise = 0.0
 
@@ -594,6 +614,9 @@ class RobotObjectTracking(RobotTracking):
         self.contact_region_body_indices_asset = [
             self.object.body_names.index(name) for name in self.contact_region_link_names
         ]
+        self.contact_region_telemetry = (
+            os.environ.get("ARTHOI4D_HDMI_CONTACT_REGION_TELEMETRY", "1") == "1"
+        )
 
         self.eef_filtered_sensor: List[List[ContactSensor]] = []
         # [self.env.scene.sensors[f"{eef_name}_{object_asset_name}_contact_forces"] for eef_name in contact_eef_body_name] for object_asset_name in self.asset.data.object_names]
@@ -616,7 +639,7 @@ class RobotObjectTracking(RobotTracking):
         # rollout exporter.
         self.eef_region_sensors: List[List[List[ContactSensor]]] = []
         self.eef_region_sensor_indices: List[List[List[int]]] = []
-        for eef_name in contact_eef_body_name:
+        for eef_name in contact_eef_body_name if self.contact_region_telemetry else ():
             matched_eef_names = self.asset.find_bodies(eef_name)[1]
             sensors_for_eef: List[List[ContactSensor]] = []
             indices_for_eef: List[List[int]] = []
@@ -701,11 +724,19 @@ class RobotObjectTracking(RobotTracking):
         init_object_pos = self._motion_reset.body_pos_w[:, self.object_body_id_motion]
         init_object_quat = self._motion_reset.body_quat_w[:, self.object_body_id_motion]
 
-        rand_samples = sample_uniform(self.object_pose_range[:, 0], self.object_pose_range[:, 1], (len(env_ids), 6), device=self.device)
-
-        init_object_pos += rand_samples[:, 0:3]
-        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-        init_object_quat = quat_mul(init_object_quat, orientations_delta)
+        if self.object_pose_randomization_enabled:
+            rand_samples = sample_uniform(
+                self.object_pose_range[:, 0], self.object_pose_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
+            init_object_pos += rand_samples[:, 0:3]
+            orientations_delta = quat_from_euler_xyz(
+                rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+            )
+            init_object_quat = quat_mul(init_object_quat, orientations_delta)
+        else:
+            rand_samples = None
+            orientations_delta = None
         
         init_object_state_w = self.object.data.default_root_state[env_ids]
         init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -719,8 +750,9 @@ class RobotObjectTracking(RobotTracking):
             init_object_pos = self._motion_reset.body_pos_w[:, object_body_id_motion]
             init_object_quat = self._motion_reset.body_quat_w[:, object_body_id_motion]
             
-            init_object_pos += rand_samples[:, 0:3]
-            init_object_quat = quat_mul(init_object_quat, orientations_delta)
+            if rand_samples is not None:
+                init_object_pos += rand_samples[:, 0:3]
+                init_object_quat = quat_mul(init_object_quat, orientations_delta)
 
             init_object_state_w = object_.data.default_root_state[env_ids]
             init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -744,11 +776,14 @@ class RobotObjectTracking(RobotTracking):
                 init_joint_pos[:] = self.object_reset_joint_pos
                 init_joint_vel.zero_()
 
-            joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
-            joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise
-            
-            init_joint_pos += joint_pos_noise
-            init_joint_vel += joint_vel_noise
+            if self.object_init_joint_pos_noise != 0.0:
+                init_joint_pos += sample_uniform(
+                    -1, 1, init_joint_pos.shape, device=self.device
+                ) * self.object_init_joint_pos_noise
+            if self.object_init_joint_vel_noise != 0.0:
+                init_joint_vel += sample_uniform(
+                    -1, 1, init_joint_vel.shape, device=self.device
+                ) * self.object_init_joint_vel_noise
             
             joint_pos_limits = self.object.data.soft_joint_pos_limits[env_ids][:, self.object_joint_indices_asset]
             joint_vel_limits = self.object.data.soft_joint_vel_limits[env_ids][:, self.object_joint_indices_asset]
@@ -830,31 +865,33 @@ class RobotObjectTracking(RobotTracking):
 
         self.eef_contact_forces_b[:] = quat_apply_inverse(object_quat_w, self.eef_contact_forces_w)
 
-        self.eef_region_forces_w.zero_()
-        for eef_index, (regions, region_indices) in enumerate(
-            zip(self.eef_region_sensors, self.eef_region_sensor_indices)
-        ):
-            for region_index, (sensors, sensor_indices) in enumerate(
-                zip(regions, region_indices)
+        if self.contact_region_telemetry:
+            self.eef_region_forces_w.zero_()
+            for eef_index, (regions, region_indices) in enumerate(
+                zip(self.eef_region_sensors, self.eef_region_sensor_indices)
             ):
-                for sensor, sensor_index in zip(sensors, sensor_indices):
-                    # The filtered dimension may contain multiple collider prims
-                    # below one URDF link, so sum it instead of assuming index 0.
-                    self.eef_region_forces_w[:, eef_index, region_index] += (
-                        sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
-                    )
-        self.eef_region_force_n[:] = torch.linalg.vector_norm(
-            self.eef_region_forces_w, dim=-1
-        )
-        self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
-        self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
-        self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
-            :, self.contact_region_body_indices_asset
-        ]
-        self.eef_region_link_center_distance_m[:] = torch.linalg.vector_norm(
-            self.contact_eef_pos_w[:, :, None] - self.contact_region_pos_w[:, None],
-            dim=-1,
-        )
+                for region_index, (sensors, sensor_indices) in enumerate(
+                    zip(regions, region_indices)
+                ):
+                    for sensor, sensor_index in zip(sensors, sensor_indices):
+                        # The filtered dimension may contain multiple collider prims
+                        # below one URDF link, so sum it instead of assuming index 0.
+                        self.eef_region_forces_w[:, eef_index, region_index] += (
+                            sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
+                        )
+            self.eef_region_force_n[:] = torch.linalg.vector_norm(
+                self.eef_region_forces_w, dim=-1
+            )
+            self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
+            self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
+            self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
+                :, self.contact_region_body_indices_asset
+            ]
+            self.eef_region_link_center_distance_m[:] = torch.linalg.vector_norm(
+                self.contact_eef_pos_w[:, :, None]
+                - self.contact_region_pos_w[:, None],
+                dim=-1,
+            )
 
     def _init_debug_draw(self):
         super()._init_debug_draw()
