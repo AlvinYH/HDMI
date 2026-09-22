@@ -119,5 +119,6 @@ class JointPosition(ActionManager):
 
         pos_target = self.default_joint_pos + self.offset
         pos_target[:, self.joint_ids] += self.applied_action * self.action_scaling
+        self.env.trace_action_target(action.squeeze(-1), self.applied_action, pos_target)
         self.asset.set_joint_position_target(pos_target)
         

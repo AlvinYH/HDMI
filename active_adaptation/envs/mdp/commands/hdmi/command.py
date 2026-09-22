@@ -1,3 +1,7 @@
+import json
+import os
+from pathlib import Path
+
 from active_adaptation.envs.mdp.base import Command
 from active_adaptation.utils.motion import MotionDataset, MotionData
 
@@ -51,6 +55,56 @@ class RobotTracking(Command):
         from . import randomizations
         from . import terminations
         super().__init__(env)
+        if "ARTHOI4D_HDMI_INPUT_PATH" in os.environ:
+            input_path = Path(
+                os.environ["ARTHOI4D_HDMI_INPUT_PATH"]
+            ).expanduser().resolve()
+
+            manifest = json.loads(
+                input_path.read_text(encoding="utf-8")
+            )
+
+            expected_body_names = list(manifest["human_body_names"])
+            expected_joint_names = list(manifest["human_joint_names"])
+
+            actual_body_names = list(self.asset.body_names)
+            actual_joint_names = list(self.asset.joint_names)
+
+            body_contract_valid = (
+                len(actual_body_names) == len(expected_body_names)
+                and len(set(actual_body_names)) == len(actual_body_names)
+                and set(actual_body_names) == set(expected_body_names)
+            )
+            if not body_contract_valid:
+                raise RuntimeError(
+                    "SMPL-X PhysX body contract mismatch: "
+                    f"expected_count={len(expected_body_names)}, "
+                    f"actual_count={len(actual_body_names)}, "
+                    f"missing={sorted(set(expected_body_names) - set(actual_body_names))}, "
+                    f"unexpected={sorted(set(actual_body_names) - set(expected_body_names))}"
+                )
+
+            joint_contract_valid = (
+                len(actual_joint_names) == len(expected_joint_names)
+                and len(set(actual_joint_names)) == len(actual_joint_names)
+                and set(actual_joint_names) == set(expected_joint_names)
+            )
+            if not joint_contract_valid:
+                raise RuntimeError(
+                    "SMPL-X PhysX joint contract mismatch: "
+                    f"expected_count={len(expected_joint_names)}, "
+                    f"actual_count={len(actual_joint_names)}, "
+                    f"missing={sorted(set(expected_joint_names) - set(actual_joint_names))}, "
+                    f"unexpected={sorted(set(actual_joint_names) - set(expected_joint_names))}"
+                )
+
+            print(
+                "[SMPL-X PhysX contract] "
+                f"bodies={len(actual_body_names)} "
+                f"joints={len(actual_joint_names)} "
+                f"root={self.root_body_name if hasattr(self, 'root_body_name') else expected_body_names[0]}",
+                flush=True,
+            )
         self.dataset = MotionDataset.create_from_path(
             data_path,
             isaac_joint_names=self.asset.joint_names,
@@ -73,6 +127,19 @@ class RobotTracking(Command):
         # get root body and joint indices in motion for reset
         self.root_body_name = root_body_name
         self.root_body_idx_motion = self.dataset.body_names.index(root_body_name)
+        self.root_body_idx_asset = self.asset.body_names.index(root_body_name)
+        # IsaacLab exposes the PhysX actor root as link zero.  The ARCTIC
+        # reference is Pelvis-rooted, so writing ``root_link_*`` to a USD
+        # whose actor root is another link silently displaces the whole body.
+        # Fail at construction rather than poisoning rollout/VecNorm later.
+        live_root_body_name = self.asset.body_names[0]
+        if live_root_body_name != self.root_body_name:
+            raise RuntimeError(
+                "SMPL-X PhysX actor root contract mismatch: "
+                f"expected={self.root_body_name!r}, "
+                f"live={live_root_body_name!r}; "
+                "re-author the USD articulation root on the Pelvis rigid body"
+            )
         
         asset_joint_names = self.asset.joint_names
         self.asset_joint_idx_motion = [self.dataset.joint_names.index(joint_name) for joint_name in asset_joint_names]
@@ -96,6 +163,12 @@ class RobotTracking(Command):
         self.pose_range = torch.tensor(pose_range_list, device=self.device)
         velocity_range_list = [velocity_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         self.velocity_range = torch.tensor(velocity_range_list, device=self.device)
+        self.pose_randomization_enabled = any(
+            float(value) != 0.0 for pair in pose_range_list for value in pair
+        )
+        self.velocity_randomization_enabled = any(
+            float(value) != 0.0 for pair in velocity_range_list for value in pair
+        )
 
         self.init_joint_pos_noise = init_joint_pos_noise
         self.init_joint_vel_noise = init_joint_vel_noise
@@ -104,17 +177,28 @@ class RobotTracking(Command):
         self.sample_motion = sample_motion
         self.replay_motion = replay_motion
         self.record_motion = record_motion
+        # Full reference-vs-PhysX hard-limit validation is a migration/debug
+        # guard.  Keep the historical behavior by default, while allowing
+        # rollout benchmarks and production training to opt out of the
+        # Python/CUDA synchronization on every reset.
+        self.validate_reset_limits = (
+            os.environ.get("ARTHOI4D_HDMI_VALIDATE_RESET_LIMITS", "1") == "1"
+        )
 
         if self.replay_motion:
             self.pose_range.fill_(0.0)
             self.init_joint_pos_noise = 0.0
             self.init_joint_vel_noise = 0.0
+            self.pose_randomization_enabled = False
+            self.velocity_randomization_enabled = False
         
         if self.record_motion:
             assert self.num_envs == 1, "record_motion only supports num_envs=1"
             self.pose_range.fill_(0.0)
             self.init_joint_pos_noise = 0.0
             self.init_joint_vel_noise = 0.0
+            self.pose_randomization_enabled = False
+            self.velocity_randomization_enabled = False
 
         if call_update:
             self._init_debug_draw()
@@ -165,37 +249,127 @@ class RobotTracking(Command):
         init_root_ang_vel = motion.body_ang_vel_w[:, self.root_body_idx_motion]
 
         # poses
-        rand_samples = sample_uniform(self.pose_range[:, 0], self.pose_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
-            rand_samples.fill_(0.0)
-        positions = init_root_pos + self.env.scene.env_origins[env_ids] + rand_samples[:, 0:3]
-        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-        orientations = quat_mul(init_root_quat, orientations_delta)
+        if self.pose_randomization_enabled and self.env.training:
+            rand_samples = sample_uniform(
+                self.pose_range[:, 0], self.pose_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
+            positions = (
+                init_root_pos + self.env.scene.env_origins[env_ids]
+                + rand_samples[:, 0:3]
+            )
+            orientations_delta = quat_from_euler_xyz(
+                rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+            )
+            orientations = quat_mul(init_root_quat, orientations_delta)
+        else:
+            positions = init_root_pos + self.env.scene.env_origins[env_ids]
+            orientations = init_root_quat
 
         # velocities
-        rand_samples = sample_uniform(self.velocity_range[:, 0], self.velocity_range[:, 1], (len(env_ids), 6), device=self.device)
-        if not self.env.training:
-            rand_samples.fill_(0.0)
-        velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1) + rand_samples
+        velocities = torch.cat([init_root_lin_vel, init_root_ang_vel], dim=-1)
+        if self.velocity_randomization_enabled and self.env.training:
+            velocities = velocities + sample_uniform(
+                self.velocity_range[:, 0], self.velocity_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
 
         self.asset.write_root_link_pose_to_sim(torch.cat([positions, orientations], dim=-1), env_ids=env_ids)
         self.asset.write_root_com_velocity_to_sim(velocities, env_ids=env_ids)
 
-        init_joint_pos = motion.joint_pos[:, self.asset_joint_idx_motion]
-        init_joint_vel = motion.joint_vel[:, self.asset_joint_idx_motion]
+        reference_joint_pos = motion.joint_pos[
+            :, self.asset_joint_idx_motion
+        ].clone()
+        reference_joint_vel = motion.joint_vel[
+            :, self.asset_joint_idx_motion
+        ].clone()
 
-        joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.init_joint_pos_noise
-        joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.init_joint_vel_noise
+        joint_pos_limits = self.asset.data.joint_pos_limits[env_ids]
+        joint_vel_limits = self.asset.data.joint_vel_limits[env_ids]
 
-        init_joint_pos += joint_pos_noise
-        init_joint_vel += joint_vel_noise
+        if self.validate_reset_limits:
+            position_outside = (
+                reference_joint_pos
+                < joint_pos_limits[..., 0] - 1.0e-5
+            ) | (
+                reference_joint_pos
+                > joint_pos_limits[..., 1] + 1.0e-5
+            )
 
-        joint_pos_limits = self.asset.data.soft_joint_pos_limits[env_ids]
-        joint_vel_limits = self.asset.data.soft_joint_vel_limits[env_ids]
-        init_joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
-        init_joint_vel.clamp_(-joint_vel_limits, joint_vel_limits)
+            if position_outside.any():
+                bad = position_outside.nonzero(as_tuple=False)[0]
+                row = int(bad[0].item())
+                joint_id = int(bad[1].item())
+
+                raise RuntimeError(
+                    "SMPL-X reference position exceeds hard limit: "
+                    f"joint={self.asset.joint_names[joint_id]}, "
+                    f"q={float(reference_joint_pos[row, joint_id])}, "
+                    f"lower={float(joint_pos_limits[row, joint_id, 0])}, "
+                    f"upper={float(joint_pos_limits[row, joint_id, 1])}"
+                )
+
+            velocity_outside = (
+                torch.abs(reference_joint_vel)
+                > joint_vel_limits + 1.0e-5
+            )
+
+            if velocity_outside.any():
+                bad = velocity_outside.nonzero(as_tuple=False)[0]
+                row = int(bad[0].item())
+                joint_id = int(bad[1].item())
+
+                raise RuntimeError(
+                    "SMPL-X reference velocity exceeds hard limit: "
+                    f"joint={self.asset.joint_names[joint_id]}, "
+                    f"qdot={float(reference_joint_vel[row, joint_id])}, "
+                    f"limit={float(joint_vel_limits[row, joint_id])}"
+                )
+
+        # Only remove tiny floating-point errors at the exact hard boundary.
+        reference_joint_pos.clamp_(
+            joint_pos_limits[..., 0],
+            joint_pos_limits[..., 1],
+        )
+        reference_joint_vel.clamp_(
+            -joint_vel_limits,
+            joint_vel_limits,
+        )
+
+        init_joint_pos = reference_joint_pos
+        init_joint_vel = reference_joint_vel
+        if self.init_joint_pos_noise != 0.0:
+            init_joint_pos = init_joint_pos + sample_uniform(
+                -1, 1, reference_joint_pos.shape, device=self.device
+            ) * self.init_joint_pos_noise
+        if self.init_joint_vel_noise != 0.0:
+            init_joint_vel = init_joint_vel + sample_uniform(
+                -1, 1, reference_joint_vel.shape, device=self.device
+            ) * self.init_joint_vel_noise
+
+        # Noise may reach the hard boundary; the unmodified reference was checked above.
+        init_joint_pos.clamp_(
+            joint_pos_limits[..., 0],
+            joint_pos_limits[..., 1],
+        )
+        init_joint_vel.clamp_(
+            -joint_vel_limits,
+            joint_vel_limits,
+        )
+        if os.environ.get("ARTHOI4D_DIAG_DEFAULT_HUMAN_JOINT_STATE", "") == "1":
+            init_joint_pos = self.asset.data.default_joint_pos[env_ids].clone()
+            init_joint_vel.zero_()
 
         self.asset.write_joint_state_to_sim(init_joint_pos, init_joint_vel, env_ids=env_ids)
+        action_manager = getattr(self.env, "action_manager", None)
+        if action_manager is not None:
+            action_joint_ids = torch.as_tensor(
+                action_manager.joint_ids, device=self.device
+            )
+            action_manager.offset[env_ids.unsqueeze(1), action_joint_ids] = (
+                init_joint_pos[:, action_joint_ids]
+                - action_manager.default_joint_pos[env_ids][:, action_joint_ids]
+            )
 
         if self.record_motion:
             if len(self.motion_frames) > 0:
@@ -402,11 +576,15 @@ class RobotObjectTracking(RobotTracking):
 
         pose_range_list = [object_pose_range.get(key, (0.0, 0.0)) for key in ["x", "y", "z", "roll", "pitch", "yaw"]]
         self.object_pose_range = torch.tensor(pose_range_list, device=self.device)
+        self.object_pose_randomization_enabled = any(
+            float(value) != 0.0 for pair in pose_range_list for value in pair
+        )
         self.object_init_joint_pos_noise = object_init_joint_pos_noise
         self.object_init_joint_vel_noise = object_init_joint_vel_noise
 
         if self.replay_motion or self.record_motion:
             self.object_pose_range.fill_(0.0)
+            self.object_pose_randomization_enabled = False
             self.object_init_joint_pos_noise = 0.0
             self.object_init_joint_vel_noise = 0.0
 
@@ -436,6 +614,9 @@ class RobotObjectTracking(RobotTracking):
         self.contact_region_body_indices_asset = [
             self.object.body_names.index(name) for name in self.contact_region_link_names
         ]
+        self.contact_region_telemetry = (
+            os.environ.get("ARTHOI4D_HDMI_CONTACT_REGION_TELEMETRY", "1") == "1"
+        )
 
         self.eef_filtered_sensor: List[List[ContactSensor]] = []
         # [self.env.scene.sensors[f"{eef_name}_{object_asset_name}_contact_forces"] for eef_name in contact_eef_body_name] for object_asset_name in self.asset.data.object_names]
@@ -458,7 +639,7 @@ class RobotObjectTracking(RobotTracking):
         # rollout exporter.
         self.eef_region_sensors: List[List[List[ContactSensor]]] = []
         self.eef_region_sensor_indices: List[List[List[int]]] = []
-        for eef_name in contact_eef_body_name:
+        for eef_name in contact_eef_body_name if self.contact_region_telemetry else ():
             matched_eef_names = self.asset.find_bodies(eef_name)[1]
             sensors_for_eef: List[List[ContactSensor]] = []
             indices_for_eef: List[List[int]] = []
@@ -543,11 +724,19 @@ class RobotObjectTracking(RobotTracking):
         init_object_pos = self._motion_reset.body_pos_w[:, self.object_body_id_motion]
         init_object_quat = self._motion_reset.body_quat_w[:, self.object_body_id_motion]
 
-        rand_samples = sample_uniform(self.object_pose_range[:, 0], self.object_pose_range[:, 1], (len(env_ids), 6), device=self.device)
-
-        init_object_pos += rand_samples[:, 0:3]
-        orientations_delta = quat_from_euler_xyz(rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5])
-        init_object_quat = quat_mul(init_object_quat, orientations_delta)
+        if self.object_pose_randomization_enabled:
+            rand_samples = sample_uniform(
+                self.object_pose_range[:, 0], self.object_pose_range[:, 1],
+                (len(env_ids), 6), device=self.device,
+            )
+            init_object_pos += rand_samples[:, 0:3]
+            orientations_delta = quat_from_euler_xyz(
+                rand_samples[:, 3], rand_samples[:, 4], rand_samples[:, 5]
+            )
+            init_object_quat = quat_mul(init_object_quat, orientations_delta)
+        else:
+            rand_samples = None
+            orientations_delta = None
         
         init_object_state_w = self.object.data.default_root_state[env_ids]
         init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -561,8 +750,9 @@ class RobotObjectTracking(RobotTracking):
             init_object_pos = self._motion_reset.body_pos_w[:, object_body_id_motion]
             init_object_quat = self._motion_reset.body_quat_w[:, object_body_id_motion]
             
-            init_object_pos += rand_samples[:, 0:3]
-            init_object_quat = quat_mul(init_object_quat, orientations_delta)
+            if rand_samples is not None:
+                init_object_pos += rand_samples[:, 0:3]
+                init_object_quat = quat_mul(init_object_quat, orientations_delta)
 
             init_object_state_w = object_.data.default_root_state[env_ids]
             init_object_state_w[:, 0:3] = init_object_pos + self.env.scene.env_origins[env_ids]
@@ -586,11 +776,14 @@ class RobotObjectTracking(RobotTracking):
                 init_joint_pos[:] = self.object_reset_joint_pos
                 init_joint_vel.zero_()
 
-            joint_pos_noise = sample_uniform(-1, 1, (init_joint_pos.shape[0], init_joint_pos.shape[1]), device=self.device) * self.object_init_joint_pos_noise
-            joint_vel_noise = sample_uniform(-1, 1, (init_joint_vel.shape[0], init_joint_vel.shape[1]), device=self.device) * self.object_init_joint_vel_noise
-            
-            init_joint_pos += joint_pos_noise
-            init_joint_vel += joint_vel_noise
+            if self.object_init_joint_pos_noise != 0.0:
+                init_joint_pos += sample_uniform(
+                    -1, 1, init_joint_pos.shape, device=self.device
+                ) * self.object_init_joint_pos_noise
+            if self.object_init_joint_vel_noise != 0.0:
+                init_joint_vel += sample_uniform(
+                    -1, 1, init_joint_vel.shape, device=self.device
+                ) * self.object_init_joint_vel_noise
             
             joint_pos_limits = self.object.data.soft_joint_pos_limits[env_ids][:, self.object_joint_indices_asset]
             joint_vel_limits = self.object.data.soft_joint_vel_limits[env_ids][:, self.object_joint_indices_asset]
@@ -672,31 +865,33 @@ class RobotObjectTracking(RobotTracking):
 
         self.eef_contact_forces_b[:] = quat_apply_inverse(object_quat_w, self.eef_contact_forces_w)
 
-        self.eef_region_forces_w.zero_()
-        for eef_index, (regions, region_indices) in enumerate(
-            zip(self.eef_region_sensors, self.eef_region_sensor_indices)
-        ):
-            for region_index, (sensors, sensor_indices) in enumerate(
-                zip(regions, region_indices)
+        if self.contact_region_telemetry:
+            self.eef_region_forces_w.zero_()
+            for eef_index, (regions, region_indices) in enumerate(
+                zip(self.eef_region_sensors, self.eef_region_sensor_indices)
             ):
-                for sensor, sensor_index in zip(sensors, sensor_indices):
-                    # The filtered dimension may contain multiple collider prims
-                    # below one URDF link, so sum it instead of assuming index 0.
-                    self.eef_region_forces_w[:, eef_index, region_index] += (
-                        sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
-                    )
-        self.eef_region_force_n[:] = torch.linalg.vector_norm(
-            self.eef_region_forces_w, dim=-1
-        )
-        self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
-        self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
-        self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
-            :, self.contact_region_body_indices_asset
-        ]
-        self.eef_region_link_center_distance_m[:] = torch.linalg.vector_norm(
-            self.contact_eef_pos_w[:, :, None] - self.contact_region_pos_w[:, None],
-            dim=-1,
-        )
+                for region_index, (sensors, sensor_indices) in enumerate(
+                    zip(regions, region_indices)
+                ):
+                    for sensor, sensor_index in zip(sensors, sensor_indices):
+                        # The filtered dimension may contain multiple collider prims
+                        # below one URDF link, so sum it instead of assuming index 0.
+                        self.eef_region_forces_w[:, eef_index, region_index] += (
+                            sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
+                        )
+            self.eef_region_force_n[:] = torch.linalg.vector_norm(
+                self.eef_region_forces_w, dim=-1
+            )
+            self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
+            self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
+            self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
+                :, self.contact_region_body_indices_asset
+            ]
+            self.eef_region_link_center_distance_m[:] = torch.linalg.vector_norm(
+                self.contact_eef_pos_w[:, :, None]
+                - self.contact_region_pos_w[:, None],
+                dim=-1,
+            )
 
     def _init_debug_draw(self):
         super()._init_debug_draw()

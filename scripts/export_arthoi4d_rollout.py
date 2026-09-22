@@ -316,7 +316,10 @@ def main(cfg: DictConfig) -> None:
                 for name, value in frame.items():
                     _require_finite(name, value, step)
                 frames.append(frame)
-                if bool(transition["next", "done"][0].item()) and not fixed_horizon:
+                if (
+                    not fixed_horizon
+                    and bool(transition["next", "done"][0].item())
+                ):
                     break
                 tensordict = transition["next"]
 

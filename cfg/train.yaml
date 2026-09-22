@@ -14,9 +14,10 @@ app:
 # total_frames: 300_000_000
 total_frames: 150_000_000
 eval_render: false
-save_interval: 300
+save_interval: 200
 seed: 0
-debug_metrics_interval: 1
+# Zero disables the optional per-iteration tracking diagnostics.
+debug_metrics_interval: 0
 checkpoint_path: null
 vecnorm: ${oc.select:algo.vecnorm,train}
 
