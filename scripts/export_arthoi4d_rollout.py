@@ -245,11 +245,9 @@ def main(cfg: DictConfig) -> None:
 
     print("[arthoi4d-export] stage=app-launch", flush=True)
 
-    # AppLauncher pins active_gpu/physics_gpu during config resolution.  On
-    # headless machines without a Vulkan ICD that can fail before PhysX is
-    # created, while the direct SimulationApp path is sufficient for the
-    # physics-only exporter used here.
-    if os.environ.get("ARTHOI4D_HDMI_DIRECT_SIM_APP", "1").lower() not in {"0", "false", "no"}:
+    # Use the same app launcher as training by default. The direct app path
+    # remains available for environments that require it explicitly.
+    if os.environ.get("ARTHOI4D_HDMI_DIRECT_SIM_APP", "0").lower() not in {"0", "false", "no"}:
         device = str(cfg.app.get("device", os.environ.get("ARTHOI4D_HDMI_APP_DEVICE", "cuda:0")))
         gpu_id = int(device.split(":", 1)[1]) if device.startswith("cuda:") else 0
         simulation_app = SimulationApp(

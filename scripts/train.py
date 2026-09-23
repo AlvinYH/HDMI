@@ -75,7 +75,7 @@ def main(cfg: DictConfig):
     run.config.update(OmegaConf.to_container(cfg))
     
     default_run_name = f"{cfg.exp_name}-{datetime.datetime.now().strftime('%Y-%m-%d-%H-%M')}"
-    run_idx = run.name.split("-")[-1]
+    run_idx = run.name.split("-")[-1] if run.name is not None else run.id
     run.name = f"{run_idx}-{default_run_name}"
     setproctitle(run.name)
 

@@ -1,0 +1,14 @@
+# @package task
+defaults:
+  - /task/SMPLX/hdmi/arthoi4d
+  - _self_
+
+# d3dhoi45 variant: object bases stay fixed on the table, so root-pose
+# tracking is a constant term there. Keep only the hinge-joint objective,
+# mirroring the fixed-base upstream hinge tasks (which disable 6D tracking).
+# ARCTIC keeps the default arthoi4d.yaml, where the object base moves with
+# the person (measured up to 34 cm) and root-pose tracking is non-redundant.
+reward:
+  object_tracking:
+    object_pos_tracking: {enabled: false}
+    object_ori_tracking: {enabled: false}

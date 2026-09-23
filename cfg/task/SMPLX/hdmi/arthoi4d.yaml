@@ -1,12 +1,14 @@
 # @package task
 defaults:
-  - base/hdmi-base
+  - /task/base/hdmi-base
   - _self_
 
 name: ArtHOI4DSMPLX
 terrain: arthoi4d_plane
 num_envs: 4096
-max_episode_length: 1000
+# 20 s episode budget, mirroring upstream hinge tasks (default 1000 steps @ 50 Hz),
+# converted to the 30 Hz control rate of this setup.
+max_episode_length: 600
 
 sim:
   # IsaacLab scene replication is part of the ArtHOI4D training contract.
@@ -20,7 +22,11 @@ robot:
   contact_body_name: Pelvis
 
 action:
-  action_scaling_replace: 0.25
+  # Uniform translation of the upstream hinge-task per-joint scales
+  # (hdmi-base table: 0.35-0.55, arm joints 0.44). The G1 regex table cannot
+  # resolve against SMPL-X joint names, so a single family-representative
+  # value is used: the midpoint of the family envelope (= code default 0.5).
+  action_scaling_replace: 0.5
   # Do not delay policy outputs beyond the common 30 Hz action boundary.
   min_delay: 0
   max_delay: 0
@@ -85,6 +91,10 @@ observation:
     body_height: {body_names: [L_Ankle, R_Ankle, Pelvis, Torso]}
     object_joint_pos: {}
     object_joint_vel: {}
+    # Shared convention of all four upstream hinge tasks: expose the object
+    # joint torque to the privileged stream (teacher senses force transmission
+    # through the hinge).
+    object_joint_torque: {}
 
 reward:
   tracking:
@@ -141,10 +151,18 @@ randomization:
   random_joint_offset: null
 
 termination:
+  # Body terms stay strict (fall = episode is dead anyway), mirroring upstream
+  # G1 tasks (e.g. truman.yaml cum_body_z_error min_steps 25).
   cum_body_pos_error: {body_names: Torso, min_steps: 25}
   cum_body_ori_error: {body_names: Torso, min_steps: 25}
   cum_body_pos_error_local: {body_names: ".*", min_steps: 25}
   cum_body_ori_error_local: {body_names: ".*", min_steps: 25}
-  cum_object_pos_error: {min_steps: 25}
-  cum_object_ori_error: {min_steps: 25}
+  # Object terms follow the shared hinge-task value (min_steps 5000 in
+  # push_door-hand / open_door-feet / traverse_door / open_foldchair-sit):
+  # object error is expected while contact is being learned and must not kill
+  # the episode. 5000 steps @ 30 Hz exceeds the episode length.
+  cum_object_pos_error: {min_steps: 5000}
+  cum_object_ori_error: {min_steps: 5000}
+  # Contact-loss tolerance inherited from hdmi-base as used by push_door-hand
+  # (min_steps 25, pos_thres 0.2 m, frc_thres 1.0 N).
   cum_lost_contact_steps: {min_steps: 25}
