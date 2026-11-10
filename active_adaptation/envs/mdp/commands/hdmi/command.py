@@ -637,27 +637,26 @@ class RobotObjectTracking(RobotTracking):
         # Keep the native reward sensors above unchanged.  These sensors are
         # exclusively the shared contact-region telemetry used by the Studio
         # rollout exporter.
-        self.eef_region_sensors: List[List[List[ContactSensor]]] = []
-        self.eef_region_sensor_indices: List[List[List[int]]] = []
-        for eef_name in contact_eef_body_name if self.contact_region_telemetry else ():
-            matched_eef_names = self.asset.find_bodies(eef_name)[1]
-            sensors_for_eef: List[List[ContactSensor]] = []
-            indices_for_eef: List[List[int]] = []
-            for region_link_name in self.contact_region_link_names:
-                sensors_for_region: List[ContactSensor] = []
-                indices_for_region: List[int] = []
-                for matched_eef_name in matched_eef_names:
-                    sensor_name = (
-                        f"{matched_eef_name}_{object_asset_name}_{region_link_name}_"
-                        "region_contact_forces"
-                    )
-                    sensor = self.env.scene.sensors[sensor_name]
-                    sensors_for_region.append(sensor)
-                    indices_for_region.append(sensor.body_names.index(matched_eef_name))
-                sensors_for_eef.append(sensors_for_region)
-                indices_for_eef.append(indices_for_region)
-            self.eef_region_sensors.append(sensors_for_eef)
-            self.eef_region_sensor_indices.append(indices_for_eef)
+        self.hand_net_sensors: List[List[ContactSensor]] = []
+        self.region_net_sensors: List[ContactSensor] = []
+        from active_adaptation.assets import ROBOT_BODY_PRIM_PATHS
+        from active_adaptation.utils.contact_region import hand_region_bodies
+
+        hand_bodies = hand_region_bodies(
+            ROBOT_BODY_PRIM_PATHS.get(self.env.cfg.robot.name, {}), contact_eef_body_name
+        ) if self.contact_region_telemetry else ()
+        for matched_eef_names in hand_bodies:
+            sensors = [self.env.scene.sensors[f"{name}_hand_net_forces"] for name in matched_eef_names]
+            if any(len(sensor.body_names) != 1 for sensor in sensors):
+                raise ValueError("Each hand force sensor must match exactly one physical body")
+            self.hand_net_sensors.append(sensors)
+        if self.contact_region_telemetry:
+            self.region_net_sensors = [
+                self.env.scene.sensors[f"{object_asset_name}_{name}_region_net_forces"]
+                for name in self.contact_region_link_names
+            ]
+            if any(len(sensor.body_names) != 1 for sensor in self.region_net_sensors):
+                raise ValueError("Each object region force sensor must match exactly one physical body")
 
         with torch.device(self.device):
             self.contact_target_pos_offset = torch.tensor(contact_target_pos_offset, device=self.device).repeat(self.num_envs, 1, 1)
@@ -669,12 +668,6 @@ class RobotObjectTracking(RobotTracking):
             self.eef_contact_forces_w = torch.zeros(self.num_envs, len(contact_eef_body_name), 3, device=self.device)
             self.eef_contact_forces_b = torch.zeros(self.num_envs, len(contact_eef_body_name), 3, device=self.device)
             region_count = len(self.contact_region_link_names)
-            self.eef_region_forces_w = torch.zeros(
-                self.num_envs, len(contact_eef_body_name), region_count, 3, device=self.device
-            )
-            self.eef_region_force_n = torch.zeros(
-                self.num_envs, len(contact_eef_body_name), region_count, device=self.device
-            )
             self.hand_force_n = torch.zeros(
                 self.num_envs, len(contact_eef_body_name), device=self.device
             )
@@ -866,24 +859,11 @@ class RobotObjectTracking(RobotTracking):
         self.eef_contact_forces_b[:] = quat_apply_inverse(object_quat_w, self.eef_contact_forces_w)
 
         if self.contact_region_telemetry:
-            self.eef_region_forces_w.zero_()
-            for eef_index, (regions, region_indices) in enumerate(
-                zip(self.eef_region_sensors, self.eef_region_sensor_indices)
-            ):
-                for region_index, (sensors, sensor_indices) in enumerate(
-                    zip(regions, region_indices)
-                ):
-                    for sensor, sensor_index in zip(sensors, sensor_indices):
-                        # The filtered dimension may contain multiple collider prims
-                        # below one URDF link, so sum it instead of assuming index 0.
-                        self.eef_region_forces_w[:, eef_index, region_index] += (
-                            sensor.data.force_matrix_w[:, sensor_index].sum(dim=1)
-                        )
-            self.eef_region_force_n[:] = torch.linalg.vector_norm(
-                self.eef_region_forces_w, dim=-1
-            )
-            self.hand_force_n[:] = self.eef_region_force_n.sum(dim=-1)
-            self.region_force_n[:] = self.eef_region_force_n.sum(dim=1)
+            from active_adaptation.utils.contact_region import reduce_net_contact_forces
+
+            hands = [torch.stack([sensor.data.net_forces_w[:, 0] for sensor in sensors], dim=1) for sensors in self.hand_net_sensors]
+            links = torch.stack([sensor.data.net_forces_w[:, 0] for sensor in self.region_net_sensors], dim=1)
+            self.hand_force_n[:], self.region_force_n[:] = reduce_net_contact_forces(hands, links)
             self.contact_region_pos_w[:] = self.object.data.body_link_pos_w[
                 :, self.contact_region_body_indices_asset
             ]

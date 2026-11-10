@@ -65,12 +65,9 @@ def _state(
     quaternion_wxyz: torch.Tensor,
     linear_velocity: torch.Tensor,
     angular_velocity: torch.Tensor,
-    ground_height: float,
 ) -> torch.Tensor:
-    """Return actual Studio-world state vectors in ``[pos, xyzw, vel, omega]`` order."""
+    """Return ground-normalized state vectors in ``[pos, xyzw, vel, omega]`` order."""
 
-    position = position.clone()
-    position[..., 2] += ground_height
     return torch.cat(
         (position, _xyzw(quaternion_wxyz), linear_velocity, angular_velocity), dim=-1
     )
@@ -81,21 +78,17 @@ def _snapshot(command, bundle: dict, human_body_ids: list[int], human_joint_ids:
 
     robot = command.asset
     object_asset = command.object
-    ground_height = float(bundle["ground_height_studio"])
-
     human_body = _state(
         robot.data.body_link_pos_w[0, human_body_ids],
         robot.data.body_link_quat_w[0, human_body_ids],
         robot.data.body_com_lin_vel_w[0, human_body_ids],
         robot.data.body_com_ang_vel_w[0, human_body_ids],
-        ground_height,
     )
     object_root = _state(
         object_asset.data.root_state_w[0, :3],
         object_asset.data.root_state_w[0, 3:7],
         object_asset.data.root_state_w[0, 7:10],
         object_asset.data.root_state_w[0, 10:13],
-        ground_height,
     )
     region_body_ids = command.contact_region_body_indices_asset
     region_link_state = _state(
@@ -103,7 +96,6 @@ def _snapshot(command, bundle: dict, human_body_ids: list[int], human_joint_ids:
         object_asset.data.body_link_quat_w[0, region_body_ids],
         object_asset.data.body_com_lin_vel_w[0, region_body_ids],
         object_asset.data.body_com_ang_vel_w[0, region_body_ids],
-        ground_height,
     )
     if command.object_joint_indices_asset is None:
         object_joint_qpos = torch.empty(0, device=command.device)

@@ -299,7 +299,8 @@ class ref_contact_pos_b(RobotObjectTrackObservation):
         if self.noise_std > 0.0:
             noise = torch.randn_like(ref_contact_pos_b).clamp(-1, 1) * self.noise_std
             ref_contact_pos_b += noise
-        self.ref_contact_pos_b = ref_contact_pos_b + self.episodic_noise + self.step_noise
+        active_hand = self.command_manager._object_contact.any(dim=0)[None, :, None]
+        self.ref_contact_pos_b = (ref_contact_pos_b + self.episodic_noise + self.step_noise) * active_hand
 
     def compute(self):
         return self.ref_contact_pos_b.view(self.num_envs, -1)
@@ -318,7 +319,8 @@ class diff_contact_pos_b(RobotObjectTrackObservation):
         robot_root_quat_w = self.command_manager.robot_root_quat_w[:, None, :] # shape: [num_envs, 1, 4]
         
         diff_contact_pos_w = ref_contact_target_pos_w - contact_eef_pos_w
-        self.diff_contact_pos_b = quat_apply_inverse(robot_root_quat_w, diff_contact_pos_w)
+        active_hand = self.command_manager._object_contact.any(dim=0)[None, :, None]
+        self.diff_contact_pos_b = quat_apply_inverse(robot_root_quat_w, diff_contact_pos_w) * active_hand
 
     def compute(self):
         return self.diff_contact_pos_b.view(self.num_envs, -1)

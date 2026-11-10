@@ -146,30 +146,22 @@ class SimpleEnv(_Env):
                         filter_prim_paths_expr=[contact_geom_prim_path],
                     ))
 
-                    # Use one filtered sensor for every selected link.  Isaac Lab
-                    # then reports forces from this hand to exactly that link,
-                    # rather than inferring benchmark contact from the native
-                    # reward target point.
-                    for region_link_name in (
-                        contact_region_link_names if contact_region_telemetry else ()
-                    ):
-                        if region_link_name not in object_body_paths:
-                            raise ValueError(
-                                "ArtHOI4D contact-region link is missing from the "
-                                f"loaded object: {region_link_name}"
-                            )
-                        region_sensor_name = (
-                            f"{eef_name}_{obj_name}_{region_link_name}_region_contact_forces"
-                        )
-                        region_geom_prim_path = (
-                            "{ENV_REGEX_NS}/" + obj_name + "/"
-                            + object_body_paths[region_link_name]
-                        )
-                        setattr(scene_cfg, region_sensor_name, ContactSensorCfg(
-                            prim_path=eef_prim_path,
-                            history_length=0,
-                            track_air_time=False,
-                            filter_prim_paths_expr=[region_geom_prim_path],
+                if contact_region_telemetry:
+                    from active_adaptation.utils.contact_region import hand_region_bodies
+
+                    region_paths = [object_body_paths[name] for name in contact_region_link_names]
+                    if len(set(region_paths)) != len(region_paths):
+                        raise ValueError("Annotated object links share a physical rigid body; separate link forces are unavailable")
+                    hand_bodies = hand_region_bodies(robot_body_paths, eef_names)
+                    for hand_body_name in (name for hand in hand_bodies for name in hand):
+                        setattr(scene_cfg, f"{hand_body_name}_hand_net_forces", ContactSensorCfg(
+                            prim_path="{ENV_REGEX_NS}/Robot/" + robot_body_paths.get(hand_body_name, hand_body_name),
+                            history_length=0, track_air_time=False,
+                        ))
+                    for region_link_name in contact_region_link_names:
+                        setattr(scene_cfg, f"{obj_name}_{region_link_name}_region_net_forces", ContactSensorCfg(
+                            prim_path="{ENV_REGEX_NS}/" + obj_name + "/" + object_body_paths[region_link_name],
+                            history_length=0, track_air_time=False,
                         ))
                     
             body_scale_rand = self.cfg.randomization.get("body_scale", None)
