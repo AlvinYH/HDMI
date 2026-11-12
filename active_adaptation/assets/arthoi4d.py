@@ -883,6 +883,28 @@ def apply_arthoi4d_table_collision_filter(scene) -> None:
             flush=True,
         )
 
+def _human_effort_limit():
+    if "ARTHOI4D_HDMI_EVAL_EFFORT_LIMITS" not in os.environ:
+        return 300.0
+    limits = json.loads(os.environ["ARTHOI4D_HDMI_EVAL_EFFORT_LIMITS"])
+    if limits is None:
+        return 300.0
+    result = {}
+    matched = {key: 0 for key in limits}
+    for name in INPUT["human_joint_names"]:
+        keys = [key for key in limits if key in name]
+        if len(keys) > 1:
+            raise ValueError(f"Multiple evaluation effort limits match {name}: {keys}")
+        if keys:
+            matched[keys[0]] += 1
+            result[name] = min(300.0, float(limits[keys[0]]))
+        else:
+            result[name] = 300.0
+    if any(value == 0 for value in matched.values()):
+        raise ValueError(f"Evaluation effort limits do not match humanoid joints: {matched}")
+    return result
+
+
 SMPLX_CFG = ArticulationCfg(
     prim_path="{ENV_REGEX_NS}/Robot",
     articulation_root_prim_path=articulation_root_prim_path,
@@ -905,7 +927,7 @@ SMPLX_CFG = ArticulationCfg(
     actuators={
         "smplx": ImplicitActuatorCfg(
             joint_names_expr=[".*"],
-            effort_limit_sim=300.0,
+            effort_limit_sim=_human_effort_limit(),
             velocity_limit_sim=100.0,
             stiffness=0.0 if os.environ.get("ARTHOI4D_DIAG_DISABLE_HUMAN_PD", "") == "1" else 80.0,
             damping=0.0 if os.environ.get("ARTHOI4D_DIAG_DISABLE_HUMAN_PD", "") == "1" else 4.0,
